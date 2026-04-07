@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "molbo"
+version = "0.1.0"
+description = "Inspect PDB/CIF molecular structures from the command line"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "molbo contributors" }]
+keywords = ["molecular", "structure", "pdb", "cif", "molstar", "viewer", "cli", "molbo"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+molbo = "molbo.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/molbo"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
