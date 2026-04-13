@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>{{ title }} — Molbo</title>
+    <title>{{ title_html }} - Molbo</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -153,18 +153,23 @@
             line-height: 1.5;
         }
     </style>
-
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/molstar@4.5.0/build/viewer/molstar.css" />
-    <script src="https://unpkg.com/lucide@latest"></script>
 </head>
 <body>
     <div class="topbar">
         <div class="topbar-left">
-            <span class="logo"><i data-lucide="atom" style="width:16px;height:16px;vertical-align:-2px;margin-right:4px;"></i>MOLBO</span>
-            <span class="filename">{{ filename }}</span>
+            <span class="logo">
+                <svg viewBox="0 0 24 24" aria-hidden="true" style="width:16px;height:16px;vertical-align:-2px;margin-right:4px;">
+                    <circle cx="12" cy="12" r="2.3" fill="currentColor"></circle>
+                    <ellipse cx="12" cy="12" rx="9" ry="3.8" fill="none" stroke="currentColor" stroke-width="1.4"></ellipse>
+                    <ellipse cx="12" cy="12" rx="9" ry="3.8" fill="none" stroke="currentColor" stroke-width="1.4" transform="rotate(60 12 12)"></ellipse>
+                    <ellipse cx="12" cy="12" rx="9" ry="3.8" fill="none" stroke="currentColor" stroke-width="1.4" transform="rotate(120 12 12)"></ellipse>
+                </svg>MOLBO
+            </span>
+            <span class="filename">{{ filename_html }}</span>
         </div>
         <div class="topbar-right">
-            <span class="badge">{{ format }}</span>
+            <span class="badge">{{ format_label_html }}</span>
         </div>
     </div>
 
@@ -182,15 +187,53 @@
 
     <script src="https://cdn.jsdelivr.net/npm/molstar@4.5.0/build/viewer/molstar.js"></script>
     <script>
-        // Render Lucide icons
-        lucide.createIcons();
-
         var FORMAT_MAP = {
             'pdb':   'pdb',
             'cif':   'mmcif',
             'mmcif': 'mmcif',
             'bcif':  'mmcif',
         };
+        var FILE_URL = {{ file_url_json }};
+        var FORMAT_KEY = {{ format_json }};
+        var AUTO_CLOSE = {{ auto_close_json }};
+        var VIEWER_STYLE = {{ style_json }};
+
+        function applyViewerStyle(viewer, style) {
+            if (style !== 'publication') {
+                return;
+            }
+
+            viewer.plugin.managers.structure.component.setOptions({
+                ...viewer.plugin.managers.structure.component.state.options,
+                visualStyle: 'polymer-cartoon+ligand-ball-and-stick'
+            });
+
+            var canvas = viewer.plugin.canvas3d;
+            if (!canvas) {
+                return;
+            }
+
+            canvas.setProps({
+                postprocessing: {
+                    occlusion: { name: 'on', params: {
+                        multiScale: { name: 'off', params: {} },
+                        radius: 5, bias: 0.8, blurKernelSize: 15,
+                        resolutionScale: 1, samples: 32,
+                        color: 0x000000
+                    }},
+                    outline: { name: 'on', params: {
+                        scale: 1, threshold: 0.33,
+                        color: 0x000000, includeTransparent: true
+                    }}
+                },
+                renderer: {
+                    ambientIntensity: 1.0,
+                    light: [
+                        { inclination: 180, azimuth: 0, color: 0xffffff, intensity: 0.0 }
+                    ]
+                },
+            });
+        }
 
         async function init() {
             var loadingEl = document.getElementById('loading');
@@ -210,42 +253,11 @@
                     collapseLeftPanel: true,
                 });
 
-                var fileUrl  = '{{ file_url }}';
-                var fmt      = FORMAT_MAP['{{ format }}'] || 'mmcif';
-                var isBinary = '{{ format }}' === 'bcif';
+                var fmt      = FORMAT_MAP[FORMAT_KEY] || 'mmcif';
+                var isBinary = FORMAT_KEY === 'bcif';
 
-                await viewer.loadStructureFromUrl(fileUrl, fmt, isBinary);
-
-                // Apply stylized look: cartoon + ball-and-stick representation
-                viewer.plugin.managers.structure.component.setOptions({
-                    ...viewer.plugin.managers.structure.component.state.options,
-                    visualStyle: 'polymer-cartoon+ligand-ball-and-stick'
-                });
-
-                // Apply stylized postprocessing (occlusion + outline) and soft lighting
-                var canvas = viewer.plugin.canvas3d;
-                if (canvas) {
-                    canvas.setProps({
-                        postprocessing: {
-                            occlusion: { name: 'on', params: {
-                                multiScale: { name: 'off', params: {} },
-                                radius: 5, bias: 0.8, blurKernelSize: 15,
-                                resolutionScale: 1, samples: 32,
-                                color: 0x000000
-                            }},
-                            outline: { name: 'on', params: {
-                                scale: 1, threshold: 0.33,
-                                color: 0x000000, includeTransparent: true
-                            }}
-                        },
-                        renderer: {
-                            ambientIntensity: 1.0,
-                            light: [
-                                { inclination: 180, azimuth: 0, color: 0xffffff, intensity: 0.0 }
-                            ]
-                        }, 
-                    });
-                }
+                await viewer.loadStructureFromUrl(FILE_URL, fmt, isBinary);
+                applyViewerStyle(viewer, VIEWER_STYLE);
 
                 loadingEl.classList.add('hidden');
             } catch (err) {
@@ -258,18 +270,18 @@
 
         init();
 
-        // Instant shutdown on tab close via sendBeacon
-        window.addEventListener('beforeunload', function () {
-            navigator.sendBeacon('/bye');
-        });
-        window.addEventListener('pagehide', function () {
-            navigator.sendBeacon('/bye');
-        });
+        if (AUTO_CLOSE) {
+            window.addEventListener('beforeunload', function () {
+                navigator.sendBeacon('/bye');
+            });
+            window.addEventListener('pagehide', function () {
+                navigator.sendBeacon('/bye');
+            });
 
-        // Heartbeat as fallback
-        setInterval(function () {
-            fetch('/heartbeat').catch(function () {});
-        }, 500);
+            setInterval(function () {
+                fetch('/heartbeat', { cache: 'no-store' }).catch(function () {});
+            }, 5000);
+        }
     </script>
 </body>
 </html>
