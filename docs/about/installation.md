@@ -12,12 +12,6 @@ For normal use, install `molbo` globally with `uv`:
 uv tool install molbo
 ```
 
-## Install with pip
-
-```bash
-pip install molbo
-```
-
 ## Development setup
 
 If you are working from a clone of the repository:
