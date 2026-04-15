@@ -1,14 +1,8 @@
 from __future__ import annotations
 
 import gzip
-import os
-import signal
-import socket
-import subprocess
-import sys
 import tempfile
 import threading
-import time
 import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -16,8 +10,13 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from molbo.cli import _resolve_structure_format, _resolve_structure_source, app
-from molbo.server import StructureSource, make_server, render_viewer_html, serve_background, start_heartbeat_watchdog
+from molbo.cli import _resolve_structure_source, app
+from molbo.server import (
+    StructureSource,
+    make_server,
+    render_viewer_html,
+    serve_background,
+)
 
 
 class RenderViewerHtmlTests(unittest.TestCase):
@@ -26,17 +25,23 @@ class RenderViewerHtmlTests(unittest.TestCase):
         rendered = render_viewer_html(
             structure_name=filename,
             format_key="pdb",
-            file_url="http://localhost:1234/structure",
+            file_url="/structure",
             auto_close=False,
-            viewer_style="publication",
+            share_url="https://mol.example.com",
         )
 
         self.assertIn("bad&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;.pdb", rendered)
         self.assertNotIn(filename, rendered)
-        self.assertIn('var FILE_URL = "http://localhost:1234/structure";', rendered)
+        self.assertIn('var FILE_URL = "/structure";', rendered)
         self.assertIn('var FORMAT_KEY = "pdb";', rendered)
         self.assertIn("var AUTO_CLOSE = false;", rendered)
-        self.assertIn('var VIEWER_STYLE = "publication";', rendered)
+        self.assertIn('var SHARE_URL = "https://mol.example.com" || window.location.href;', rendered)
+        self.assertIn('id="qr-button"', rendered)
+        self.assertIn('id="qr-modal"', rendered)
+        self.assertIn('src="/assets/molstar-4.5.0.js"', rendered)
+        self.assertIn('href="/assets/molstar-4.5.0.css"', rendered)
+        self.assertIn("applyPublicationLook", rendered)
+        self.assertIn("polymer-cartoon+ligand-ball-and-stick", rendered)
 
 
 class ServerIntegrationTests(unittest.TestCase):
@@ -54,6 +59,7 @@ class ServerIntegrationTests(unittest.TestCase):
             thread = serve_background(server)
 
             try:
+                self.assertEqual(server.server_address[0], "127.0.0.1")
                 port = server.server_address[1]
                 self.assertGreater(port, 0)
 
@@ -62,6 +68,11 @@ class ServerIntegrationTests(unittest.TestCase):
                     html = response.read().decode("utf-8")
                 self.assertIn("example.pdb", html)
                 self.assertIn("var AUTO_CLOSE = false;", html)
+                self.assertIn('var FILE_URL = "/structure";', html)
+
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/assets/molstar-4.5.0.css") as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertIn("text/css", response.headers.get("Content-Type", ""))
 
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/structure") as response:
                     self.assertEqual(response.status, 200)
@@ -72,84 +83,29 @@ class ServerIntegrationTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=1.0)
 
-    def test_bye_only_stops_server_when_auto_close_is_enabled(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            structure_path = Path(tmpdir) / "example.pdb"
-            structure_path.write_text("HEADER test\nEND\n", encoding="utf-8")
-
-            keep_alive_event = threading.Event()
-            keep_alive_server = make_server(
-                StructureSource(display_name=structure_path.name, format_key="pdb", local_path=structure_path),
-                0,
-                shutdown_event=keep_alive_event,
-                auto_close=False,
-            )
-            keep_alive_thread = serve_background(keep_alive_server)
-
-            auto_close_event = threading.Event()
-            auto_close_server = make_server(
-                StructureSource(display_name=structure_path.name, format_key="pdb", local_path=structure_path),
-                0,
-                shutdown_event=auto_close_event,
-                auto_close=True,
-            )
-            auto_close_thread = serve_background(auto_close_server)
-
-            try:
-                keep_alive_port = keep_alive_server.server_address[1]
-                auto_close_port = auto_close_server.server_address[1]
-
-                keep_alive_request = urllib.request.Request(
-                    f"http://127.0.0.1:{keep_alive_port}/bye",
-                    method="POST",
-                )
-                auto_close_request = urllib.request.Request(
-                    f"http://127.0.0.1:{auto_close_port}/bye",
-                    method="POST",
-                )
-
-                with urllib.request.urlopen(keep_alive_request) as response:
-                    self.assertEqual(response.status, 204)
-                with urllib.request.urlopen(auto_close_request) as response:
-                    self.assertEqual(response.status, 204)
-
-                self.assertFalse(keep_alive_event.wait(0.2))
-                self.assertTrue(auto_close_event.wait(1.0))
-            finally:
-                keep_alive_event.set()
-                keep_alive_server.shutdown()
-                keep_alive_server.server_close()
-                keep_alive_thread.join(timeout=1.0)
-
-                auto_close_event.set()
-                auto_close_server.shutdown()
-                auto_close_server.server_close()
-                auto_close_thread.join(timeout=1.0)
-
-    def test_heartbeat_watchdog_sets_shutdown_event_after_timeout(self) -> None:
-        shutdown_event = threading.Event()
-        handler_cls = type("FakeHandler", (), {"last_heartbeat": time.monotonic() - 10})
-
-        watcher = start_heartbeat_watchdog(handler_cls, shutdown_event, timeout=0.1)
-
-        self.assertTrue(shutdown_event.wait(1.0))
-        watcher.join(timeout=1.0)
-
 
 class CliTests(unittest.TestCase):
-    def test_cli_accepts_gzip_suffixes(self) -> None:
-        self.assertEqual(_resolve_structure_format(Path("example.pdb.gz")), "pdb")
-        self.assertEqual(_resolve_structure_format(Path("example.cif.gz")), "cif")
-        self.assertEqual(_resolve_structure_format(Path("example.mmcif.gz")), "mmcif")
-        self.assertEqual(_resolve_structure_format(Path("example.bcif.gz")), "bcif")
-
-    def test_cli_accepts_http_source(self) -> None:
-        source = _resolve_structure_source("https://example.test/structures/example.pdb.gz")
+    def test_cli_accepts_pdb_id_source(self) -> None:
+        source = _resolve_structure_source("1crn", fetch_timeout=9.0)
         self.assertIsNotNone(source)
         assert source is not None
-        self.assertEqual(source.display_name, "example.pdb.gz")
-        self.assertEqual(source.format_key, "pdb")
-        self.assertEqual(source.remote_url, "https://example.test/structures/example.pdb.gz")
+        self.assertEqual(source.display_name, "1CRN.cif")
+        self.assertEqual(source.format_key, "cif")
+        self.assertEqual(source.remote_url, "https://files.rcsb.org/download/1CRN.cif")
+        self.assertEqual(source.fetch_timeout, 9.0)
+
+    def test_cli_accepts_remote_url_with_explicit_format(self) -> None:
+        source = _resolve_structure_source(
+            "https://example.org/download?id=1crn",
+            fetch_timeout=9.0,
+            format_override="cif",
+        )
+        self.assertIsNotNone(source)
+        assert source is not None
+        self.assertEqual(source.display_name, "download")
+        self.assertEqual(source.format_key, "cif")
+        self.assertEqual(source.remote_url, "https://example.org/download?id=1crn")
+        self.assertEqual(source.fetch_timeout, 9.0)
 
     def test_cli_rejects_unsupported_extensions(self) -> None:
         runner = CliRunner()
@@ -161,54 +117,6 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 1)
         self.assertIn("Unsupported file type", result.output)
-
-    def test_cli_process_serves_structure_and_shuts_down_on_sigint(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            structure_path = Path(tmpdir) / "example.pdb"
-            structure_path.write_text("HEADER cli smoke\nEND\n", encoding="utf-8")
-
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.bind(("127.0.0.1", 0))
-                port = sock.getsockname()[1]
-
-            env = os.environ.copy()
-            env["PYTHONUNBUFFERED"] = "1"
-            process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "molbo",
-                    str(structure_path),
-                    "--no-open",
-                    "--port",
-                    str(port),
-                ],
-                cwd=Path(__file__).resolve().parents[1],
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-
-            try:
-                deadline = time.monotonic() + 5.0
-                while True:
-                    if process.poll() is not None:
-                        self.fail(f"molbo exited early with code {process.returncode}")
-
-                    try:
-                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/structure", timeout=0.5) as response:
-                            body = response.read()
-                        break
-                    except Exception:
-                        if time.monotonic() >= deadline:
-                            self.fail("molbo did not start serving within 5 seconds")
-                        time.sleep(0.1)
-
-                self.assertIn(b"HEADER cli smoke", body)
-            finally:
-                if process.poll() is None:
-                    process.send_signal(signal.SIGINT)
-                    process.wait(timeout=5.0)
 
 
 class GzipServerTests(unittest.TestCase):

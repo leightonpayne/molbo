@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import html
 import json
 import mimetypes
@@ -10,13 +11,35 @@ import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from importlib.resources import files
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
-_VIEWER_TEMPLATE = (Path(__file__).parent / "viewer.html").read_text(encoding="utf-8")
+from molbo import __version__
+
+_VIEWER_TEMPLATE = files("molbo").joinpath("viewer.html").read_text(encoding="utf-8")
+_REMOTE_FETCH_ATTEMPTS = 2
+_REMOTE_FETCH_RETRY_DELAY = 0.25
+_STREAM_CHUNK_SIZE = 64 * 1024
+
+
+@dataclass(frozen=True)
+class VendoredAsset:
+    package_name: str
+    content_type: str
+
+
+_VENDORED_ASSETS: dict[str, VendoredAsset] = {
+    "/assets/molstar-4.5.0.css": VendoredAsset("molstar-4.5.0.css", "text/css; charset=utf-8"),
+    "/assets/molstar-4.5.0.js": VendoredAsset("molstar-4.5.0.js", "application/javascript; charset=utf-8"),
+    "/assets/qrcode-generator-2.0.4.min.js": VendoredAsset(
+        "qrcode-generator-2.0.4.min.js",
+        "application/javascript; charset=utf-8",
+    ),
+}
 
 # ── MIME helpers ─────────────────────────────────────────────────────────────
 
@@ -36,10 +59,16 @@ class StructureSource:
     format_key: str
     local_path: Path | None = None
     remote_url: str | None = None
+    fetch_timeout: float = 30.0
 
     @property
     def is_remote(self) -> bool:
         return self.remote_url is not None
+
+
+@lru_cache(maxsize=None)
+def _load_vendored_asset(package_name: str) -> bytes:
+    return files("molbo").joinpath("vendor", package_name).read_bytes()
 
 
 def _guess_mime(name: str) -> str:
@@ -55,6 +84,13 @@ def _guess_content_encoding(name: str) -> str | None:
     return "gzip" if name.lower().endswith(".gz") else None
 
 
+def format_host_for_url(host: str) -> str:
+    """Return *host* in a form suitable for an http:// URL."""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
 def display_name_from_url(url: str) -> str:
     """Return a readable filename derived from a remote structure URL."""
     parsed = urlparse(url)
@@ -67,7 +103,7 @@ def render_viewer_html(
     format_key: str,
     file_url: str,
     auto_close: bool,
-    viewer_style: str,
+    share_url: str | None = None,
 ) -> str:
     """Render the viewer template with escaped HTML and JSON-safe script values."""
     replacements = {
@@ -77,7 +113,7 @@ def render_viewer_html(
         "{{ format_json }}": json.dumps(format_key),
         "{{ file_url_json }}": json.dumps(file_url),
         "{{ auto_close_json }}": json.dumps(auto_close),
-        "{{ style_json }}": json.dumps(viewer_style),
+        "{{ share_url_json }}": json.dumps(share_url),
     }
     rendered = _VIEWER_TEMPLATE
     for placeholder, value in replacements.items():
@@ -95,7 +131,7 @@ class _Handler(BaseHTTPRequestHandler):
     html_cache: str | None = None
     shutdown_event: threading.Event | None = None
     auto_close: bool = False
-    viewer_style: str = "publication"
+    share_url: str | None = None
     last_heartbeat: float = 0.0
 
     # Silence default request logging
@@ -105,19 +141,22 @@ class _Handler(BaseHTTPRequestHandler):
     # ── routing ──────────────────────────────────────────────────────────
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path == "/":
+        path = urlparse(self.path).path
+        if path == "/":
             self._serve_viewer()
-        elif self.path == "/structure":
+        elif path == "/structure":
             self._serve_structure()
-        elif self.path == "/heartbeat":
+        elif path in _VENDORED_ASSETS:
+            self._serve_asset(path)
+        elif path == "/heartbeat":
             self._serve_heartbeat()
-        elif self.path == "/bye":
+        elif path == "/bye":
             self._serve_bye()
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path == "/bye":
+        if urlparse(self.path).path == "/bye":
             self._serve_bye()
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -126,13 +165,12 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _serve_viewer(self) -> None:
         if self.html_cache is None:
-            port = self.server.server_address[1]
             type(self).html_cache = render_viewer_html(
                 structure_name=self.structure_source.display_name,
                 format_key=self.structure_source.format_key,
-                file_url=f"http://localhost:{port}/structure",
+                file_url="/structure",
                 auto_close=self.auto_close,
-                viewer_style=self.viewer_style,
+                share_url=self.share_url,
             )
         body = self.html_cache.encode()  # type: ignore[union-attr]
         self.send_response(HTTPStatus.OK)
@@ -149,6 +187,16 @@ class _Handler(BaseHTTPRequestHandler):
             self._serve_remote_structure()
             return
         self._serve_local_structure()
+
+    def _serve_asset(self, path: str) -> None:
+        asset = _VENDORED_ASSETS[path]
+        body = _load_vendored_asset(asset.package_name)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", asset.content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _serve_local_structure(self) -> None:
         assert self.structure_source.local_path is not None
@@ -168,7 +216,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             with self.structure_source.local_path.open("rb") as handle:
-                while chunk := handle.read(64 * 1024):
+                while chunk := handle.read(_STREAM_CHUNK_SIZE):
                     self.wfile.write(chunk)
         except (BrokenPipeError, ConnectionResetError):
             return
@@ -177,12 +225,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _serve_remote_structure(self) -> None:
         assert self.structure_source.remote_url is not None
-        request = Request(
-            self.structure_source.remote_url,
-            headers={"User-Agent": "molbo/0.1.0"},
-        )
         try:
-            with urlopen(request, timeout=30) as response:
+            with self._open_remote_structure() as response:
                 self.send_response(getattr(response, "status", HTTPStatus.OK))
                 content_type = response.headers.get("Content-Type") or _guess_mime(
                     self.structure_source.display_name
@@ -202,14 +246,41 @@ class _Handler(BaseHTTPRequestHandler):
                 self._cors_headers()
                 self.end_headers()
 
-                while chunk := response.read(64 * 1024):
+                while chunk := response.read(_STREAM_CHUNK_SIZE):
                     self.wfile.write(chunk)
         except HTTPError as exc:
-            self.send_error(exc.code, f"Upstream server returned {exc.code}")
-        except URLError:
-            self.send_error(HTTPStatus.BAD_GATEWAY, "Failed to fetch remote structure")
+            detail = str(exc.reason) if exc.reason else "request failed"
+            self.send_error(exc.code, f"Upstream server returned {exc.code}: {detail}")
+        except TimeoutError:
+            self.send_error(HTTPStatus.GATEWAY_TIMEOUT, "Remote structure request timed out")
+        except URLError as exc:
+            detail = str(exc.reason) if exc.reason else "connection failed"
+            self.send_error(HTTPStatus.BAD_GATEWAY, f"Failed to fetch remote structure: {detail}")
         except (BrokenPipeError, ConnectionResetError):
             return
+
+    def _open_remote_structure(self):
+        assert self.structure_source.remote_url is not None
+        last_error: URLError | TimeoutError | None = None
+        for attempt in range(_REMOTE_FETCH_ATTEMPTS):
+            request = Request(
+                self.structure_source.remote_url,
+                headers={
+                    "User-Agent": f"molbo/{__version__}",
+                    "Accept": "*/*",
+                },
+            )
+            try:
+                return urlopen(request, timeout=self.structure_source.fetch_timeout)
+            except HTTPError:
+                raise
+            except (TimeoutError, URLError) as exc:
+                last_error = exc
+                if attempt + 1 == _REMOTE_FETCH_ATTEMPTS:
+                    raise
+                time.sleep(_REMOTE_FETCH_RETRY_DELAY * (attempt + 1))
+
+        raise RuntimeError(f"unreachable remote fetch state: {last_error}")
 
     # ── helpers ──────────────────────────────────────────────────────────
 
@@ -243,9 +314,10 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 def make_server(
     structure_source: StructureSource,
     port: int,
+    host: str = "127.0.0.1",
     shutdown_event: threading.Event | None = None,
     auto_close: bool = False,
-    viewer_style: str = "publication",
+    share_url: str | None = None,
 ) -> HTTPServer:
     """Create (but don't start) an HTTPServer for *structure_path*."""
     handler = type("Handler", (_Handler,), {
@@ -253,10 +325,10 @@ def make_server(
         "html_cache": None,
         "shutdown_event": shutdown_event,
         "auto_close": auto_close,
-        "viewer_style": viewer_style,
+        "share_url": share_url,
         "last_heartbeat": time.monotonic(),
     })
-    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    server = ThreadingHTTPServer((host, port), handler)
     return server
 
 
@@ -277,11 +349,6 @@ def start_heartbeat_watchdog(
     t = threading.Thread(target=_watch, daemon=True)
     t.start()
     return t
-
-
-def serve_blocking(server: HTTPServer) -> None:
-    """Run the server until interrupted."""
-    server.serve_forever()
 
 
 def serve_background(server: HTTPServer) -> threading.Thread:

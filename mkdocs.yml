@@ -1,0 +1,68 @@
+site_name: Molbo
+site_url: https://leightonpayne.github.io/molbo
+site_description: >-
+  Quickly open PDB/CIF files in Mol* from the terminal.
+
+repo_name: leightonpayne/molbo
+repo_url: https://github.com/leightonpayne/molbo
+edit_uri: https://github.com/leightonpayne/molbo/edit/main/docs/
+
+copyright: "&copy; 2026 Leighton Payne"
+
+theme:
+  name: material
+  variant: modern
+  features:
+    - content.code.copy
+    - content.code.annotate
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.path
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: lucide/moon-star
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: orange
+      toggle:
+        icon: lucide/sun
+        name: Switch to system preference
+  favicon: static/molbo-mascot.png
+  logo: static/molbo-mascot.svg
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - fenced_code
+  - pymdownx.keys
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/leightonpayne/molbo
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/molbo/
+    - icon: fontawesome/brands/bluesky
+      link: https://bsky.app/profile/leightonpayne.bsky.social
+    - icon: fontawesome/brands/x-twitter
+      link: https://x.com/leightonpayne
+
+nav:
+  - Home:
+      - Overview: index.md
+      - Installation: about/installation.md
+      - Identity: about/identity.md
+      - License: about/license.md
+      - Contributing: about/contributing.md
+  - Usage:
+      - Quickstart: usage/quickstart.md
+      - Inputs: usage/inputs.md
+      - Sharing Sessions: usage/sharing.md

@@ -1,49 +1,31 @@
-# molbo
+# Molbo
 
-A little tool for quickly opening PDB/CIF molecular structures in [Mol\*](https://molstar.org/) from the terminal.
+[![Support](https://img.shields.io/pypi/status/molbo?label=support&color=f3c539)](https://pypi.org/project/molbo/) [![PyPI](https://img.shields.io/pypi/v/molbo?label=pypi&color=107cb8)](https://pypi.org/project/molbo/)
 
-`molbo` starts a local HTTP server, serves an HTML page that loads the Mol\* Viewer from CDN, the viewer fetches the structure file from the same local server, and the browser renders the visualization. Inputs can be local files or remote `http(s)` URLs. By default the server stays alive until you press **Ctrl+C**. If you want the old "close the tab and exit" behavior, enable `--auto-close`.
+<p align="center">
+  <img src="docs/static/molbo-logo.png" width="50%" alt="poorly drawn molbo logo">
+</p>
+
+## Overview
+
+`molbo` is a command-line launcher for interactive molecular structure viewing in [Mol*](https://molstar.org/). It accepts local structure files, remote structure URLs, 4-character PDB IDs, and starts a small HTTP server that serves a self-contained Mol* viewer from vendored frontend assets.
 
 ## Installation
 
 ```bash
-pip install -e .
+uv tool install molbo
 ```
 
 ## Usage
 
+Opening a structure is as easy as:
+
 ```bash
 molbo structure.pdb
-
-# Gzipped inputs work too
-molbo structure.pdb.gz
-
-# Remote URLs work too
-molbo https://files.rcsb.org/download/1CRN.pdb
-
-# Open on a specific port
-molbo model.cif --port 8080
-
-# Don't auto-open the browser
-molbo structure.pdb --no-open
-
-# Use the plain Mol* look instead of the stylized publication preset
-molbo structure.pdb --style default
-
-# Shut down automatically when the viewer tab closes
-molbo structure.pdb --auto-close
-
-# Auto-close after 30 seconds without browser heartbeats
-molbo structure.pdb --idle-timeout 30
 ```
 
-## Notes
-
-- The viewer assets are loaded from CDN, so the browser needs network access to fetch Mol*.
-- Supported inputs: local or remote `.pdb`, `.cif`, `.mmcif`, `.bcif`, and their `.gz` variants.
-- Available styles: `publication` and `default`.
-- `--idle-timeout` implies `--auto-close`.
+Read [the documentation](https://leightonpayne.github.io/molbo/) for more information on what `molbo` can do.
 
 ## License
 
-MIT
+`molbo` is released under the [MIT license](https://choosealicense.com/licenses/mit/). The package also vendors frontend assets available under the [MIT license](https://choosealicense.com/licenses/mit/). See `src/molbo/vendor/LICENSE-molstar` and `src/molbo/vendor/LICENSE-qrcode-generator` for more information.
