@@ -1,0 +1,73 @@
+[project]
+site_name = "Molbo"
+site_url = "https://leightonpayne.github.io/molbo"
+site_description = "Quickly open PDB/CIF files in Mol* from the terminal."
+repo_name = "leightonpayne/molbo"
+repo_url = "https://github.com/leightonpayne/molbo"
+edit_uri = "https://github.com/leightonpayne/molbo/edit/main/docs/"
+copyright = "Copyright &copy; 2026 Leighton Payne"
+nav = [
+  { Home = [
+    { Overview = "index.md" },
+    { Installation = "about/installation.md" },
+    { Identity = "about/identity.md" },
+    { License = "about/license.md" },
+    { Contributing = "about/contributing.md" },
+  ] },
+  { Usage = [
+    { Quickstart = "usage/quickstart.md" },
+    { Inputs = "usage/inputs.md" },
+    { "Sharing Sessions" = "usage/sharing.md" },
+  ] },
+]
+
+[project.theme]
+name = "flexoki"
+features = [
+  "content.code.copy",
+  "content.code.annotate",
+  "navigation.tabs",
+  "navigation.tabs.sticky",
+  "navigation.path",
+]
+favicon = "static/molbo-mascot.png"
+logo = "static/molbo-mascot.svg"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+primary = "base"
+accent = "yellow"
+toggle.icon = "lucide/moon-star"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+primary = "base"
+accent = "yellow"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to system preference"
+
+[project.markdown_extensions.admonition]
+[project.markdown_extensions.fenced_code]
+[project.markdown_extensions.pymdownx.keys]
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/leightonpayne/molbo"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/python"
+link = "https://pypi.org/project/molbo/"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/bluesky"
+link = "https://bsky.app/profile/leightonpayne.bsky.social"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/x-twitter"
+link = "https://x.com/leightonpayne"
+
+[project.extra.flexoki]
+linkout_icons = true
