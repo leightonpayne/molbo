@@ -43,14 +43,14 @@ wheels = [
 
 [[package]]
 name = "flexoki-zensical"
-version = "0.1.0"
+version = "0.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "zensical" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/eb/67/7412ba9c8a6b1bc111c1e135a3de3d46cbddb2ecaf0cce236c4d827fe21b/flexoki_zensical-0.1.0.tar.gz", hash = "sha256:a07bb00d3ce6e2f0023080fda6d7efa987290d8b792002ab30f92096e56664a9", size = 7431, upload-time = "2026-05-23T20:04:51.01Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f5/53/dadd6d46f40f7ba0c1ca1b310d9f64298026f4d23785d5811c90ae912cde/flexoki_zensical-0.1.1.tar.gz", hash = "sha256:5d8315af21ed3b51da09fb7fc83f1444b7a27d32fd0a40dc7693dd43d13584cb", size = 7482, upload-time = "2026-05-23T20:57:15.433Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d0/1d/f69d4087bb54272e790c0ef7264e5f475bcddbb63dc06984de3f946bf8ed/flexoki_zensical-0.1.0-py3-none-any.whl", hash = "sha256:c9263b772ebb1706c873e4dac241a3f07644e66ce7dc24604082dda3ae74b857", size = 8963, upload-time = "2026-05-23T20:04:49.487Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/2c/ca3f2ecba9e2183ed10fc21da7756bcbceb0f64c53ef2792654a5e1a36c0/flexoki_zensical-0.1.1-py3-none-any.whl", hash = "sha256:68f08dba62c98e11886febc57e015e20a908df23b348dc6fb880f6d2dfe45f46", size = 8998, upload-time = "2026-05-23T20:57:13.606Z" },
 ]
 
 [[package]]
