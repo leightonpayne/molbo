@@ -10,7 +10,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from molbo.cli import _resolve_structure_source, app
+from molbo.cli import _normalize_base_url, _resolve_structure_source, app
 from molbo.server import (
     StructureSource,
     make_server,
@@ -42,6 +42,28 @@ class RenderViewerHtmlTests(unittest.TestCase):
         self.assertIn('href="/assets/molstar-4.5.0.css"', rendered)
         self.assertIn("applyPublicationLook", rendered)
         self.assertIn("polymer-cartoon+ligand-ball-and-stick", rendered)
+
+    def test_render_viewer_html_serializes_prefixed_urls(self) -> None:
+        rendered = render_viewer_html(
+            structure_name="example.pdb",
+            format_key="pdb",
+            file_url="/s/demo/structure",
+            auto_close=True,
+            share_url="https://mol.example.com/s/demo/",
+            molstar_css_url="/s/demo/assets/molstar-4.5.0.css",
+            molstar_js_url="/s/demo/assets/molstar-4.5.0.js",
+            qrcode_js_url="/s/demo/assets/qrcode-generator-2.0.4.min.js",
+            heartbeat_url="/s/demo/heartbeat",
+            bye_url="/s/demo/bye",
+        )
+
+        self.assertIn('var FILE_URL = "/s/demo/structure";', rendered)
+        self.assertIn('var AUTO_CLOSE = true;', rendered)
+        self.assertIn('var SHARE_URL = "https://mol.example.com/s/demo/" || window.location.href;', rendered)
+        self.assertIn('var HEARTBEAT_URL = "/s/demo/heartbeat";', rendered)
+        self.assertIn('var BYE_URL = "/s/demo/bye";', rendered)
+        self.assertIn('src="/s/demo/assets/molstar-4.5.0.js"', rendered)
+        self.assertIn('href="/s/demo/assets/molstar-4.5.0.css"', rendered)
 
 
 class ServerIntegrationTests(unittest.TestCase):
@@ -85,6 +107,11 @@ class ServerIntegrationTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_base_url_accepts_path_prefix(self) -> None:
+        viewer_url, base_path = _normalize_base_url("https://mol.example.com/s/demo/")
+        self.assertEqual(viewer_url, "https://mol.example.com/s/demo/")
+        self.assertEqual(base_path, "/s/demo")
+
     def test_cli_accepts_pdb_id_source(self) -> None:
         source = _resolve_structure_source("1crn", fetch_timeout=9.0)
         self.assertIsNotNone(source)
@@ -196,6 +223,50 @@ class RemoteServerTests(unittest.TestCase):
             upstream.shutdown()
             upstream.server_close()
             upstream_thread.join(timeout=1.0)
+
+
+class PrefixedServerTests(unittest.TestCase):
+    def test_server_serves_session_under_path_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            structure_path = Path(tmpdir) / "example.pdb"
+            structure_bytes = b"HEADER prefixed test\nEND\n"
+            structure_path.write_bytes(structure_bytes)
+            shutdown_event = threading.Event()
+            server = make_server(
+                StructureSource(display_name=structure_path.name, format_key="pdb", local_path=structure_path),
+                0,
+                shutdown_event=shutdown_event,
+                share_url="https://mol.example.com/s/demo/",
+                base_path="/s/demo",
+            )
+            thread = serve_background(server)
+
+            try:
+                port = server.server_address[1]
+
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/s/demo/") as response:
+                    self.assertEqual(response.status, 200)
+                    html = response.read().decode("utf-8")
+                self.assertIn('var FILE_URL = "/s/demo/structure";', html)
+                self.assertIn('src="/s/demo/assets/molstar-4.5.0.js"', html)
+                self.assertIn('var HEARTBEAT_URL = "/s/demo/heartbeat";', html)
+
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/s/demo/assets/molstar-4.5.0.css") as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertIn("text/css", response.headers.get("Content-Type", ""))
+
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/s/demo/structure") as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.read(), structure_bytes)
+
+                opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler)
+                with opener.open(f"http://127.0.0.1:{port}/s/demo") as response:
+                    self.assertEqual(response.geturl(), f"http://127.0.0.1:{port}/s/demo/")
+            finally:
+                shutdown_event.set()
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=1.0)
 
 
 if __name__ == "__main__":

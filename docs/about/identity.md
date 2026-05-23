@@ -10,7 +10,7 @@ icon: lucide/paintbrush
 
 ## Logo
 
-The typeface is [PicNic](https://www.clemencefontaine.fr/page/isobar.html), designed by Mariel Nils and licensed under the [CUTE (Conditions d'Utilisation Typographiques Engageantes) Terms of Use](https://genderfluid.space/).
+The typeface is [PicNic](https://typotheque.genderfluid.space/fr/fontes/picnic), designed by Mariel Nils and licensed under the [CUTE (Conditions d'Utilisation Typographiques Engageantes) Terms of Use](https://genderfluid.space/).
 
 <p align="center">
   <img src="../../static/molbo-mascot.png" width="80" alt="Molbo mascot">

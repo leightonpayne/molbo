@@ -49,3 +49,26 @@ You can also put `molbo` behind:
 - Caddy
 - nginx
 - any reverse proxy that forwards HTTP traffic to the local server
+
+## Share multiple sessions on one domain with path prefixes
+
+You can also mount separate `molbo` processes under different paths on the same hostname:
+
+```text
+https://molbo.example.com/s/demo-1/
+https://molbo.example.com/s/demo-2/
+```
+
+Start each session with a distinct path in `--base-url`:
+
+```bash
+molbo 1crn --host 127.0.0.1 --port 8081 --no-open \
+  --base-url https://molbo.example.com/s/demo-1
+
+molbo 4hhb --host 127.0.0.1 --port 8082 --no-open \
+  --base-url https://molbo.example.com/s/demo-2
+```
+
+Then configure your reverse proxy so each path prefix forwards to the matching local port.
+
+This is still one `molbo` process per session. `molbo` does not yet include a built-in multi-session registry or router.

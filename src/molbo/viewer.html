@@ -254,7 +254,7 @@
             }
         }
     </style>
-    <link rel="stylesheet" href="/assets/molstar-4.5.0.css" />
+    <link rel="stylesheet" href="{{ molstar_css_url_html }}" />
 </head>
 <body>
     <div class="topbar">
@@ -298,8 +298,8 @@
         </div>
     </div>
 
-    <script src="/assets/molstar-4.5.0.js"></script>
-    <script src="/assets/qrcode-generator-2.0.4.min.js"></script>
+    <script src="{{ molstar_js_url_html }}"></script>
+    <script src="{{ qrcode_js_url_html }}"></script>
     <script>
         var FORMAT_MAP = {
             'pdb':   'pdb',
@@ -311,6 +311,8 @@
         var FORMAT_KEY = {{ format_json }};
         var AUTO_CLOSE = {{ auto_close_json }};
         var SHARE_URL = {{ share_url_json }} || window.location.href;
+        var HEARTBEAT_URL = {{ heartbeat_url_json }};
+        var BYE_URL = {{ bye_url_json }};
 
         function applyPublicationLook(viewer) {
             viewer.plugin.managers.structure.component.setOptions({
@@ -434,14 +436,14 @@
 
         if (AUTO_CLOSE) {
             window.addEventListener('beforeunload', function () {
-                navigator.sendBeacon('/bye');
+                navigator.sendBeacon(BYE_URL);
             });
             window.addEventListener('pagehide', function () {
-                navigator.sendBeacon('/bye');
+                navigator.sendBeacon(BYE_URL);
             });
 
             setInterval(function () {
-                fetch('/heartbeat', { cache: 'no-store' }).catch(function () {});
+                fetch(HEARTBEAT_URL, { cache: 'no-store' }).catch(function () {});
             }, 5000);
         }
     </script>

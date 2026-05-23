@@ -104,21 +104,60 @@ def render_viewer_html(
     file_url: str,
     auto_close: bool,
     share_url: str | None = None,
+    molstar_css_url: str = "/assets/molstar-4.5.0.css",
+    molstar_js_url: str = "/assets/molstar-4.5.0.js",
+    qrcode_js_url: str = "/assets/qrcode-generator-2.0.4.min.js",
+    heartbeat_url: str = "/heartbeat",
+    bye_url: str = "/bye",
 ) -> str:
     """Render the viewer template with escaped HTML and JSON-safe script values."""
     replacements = {
         "{{ title_html }}": html.escape(structure_name, quote=True),
         "{{ filename_html }}": html.escape(structure_name, quote=True),
         "{{ format_label_html }}": html.escape(format_key, quote=True),
+        "{{ molstar_css_url_html }}": html.escape(molstar_css_url, quote=True),
+        "{{ molstar_js_url_html }}": html.escape(molstar_js_url, quote=True),
+        "{{ qrcode_js_url_html }}": html.escape(qrcode_js_url, quote=True),
         "{{ format_json }}": json.dumps(format_key),
         "{{ file_url_json }}": json.dumps(file_url),
         "{{ auto_close_json }}": json.dumps(auto_close),
         "{{ share_url_json }}": json.dumps(share_url),
+        "{{ heartbeat_url_json }}": json.dumps(heartbeat_url),
+        "{{ bye_url_json }}": json.dumps(bye_url),
     }
     rendered = _VIEWER_TEMPLATE
     for placeholder, value in replacements.items():
         rendered = rendered.replace(placeholder, value)
     return rendered
+
+
+def normalize_base_path(path: str | None) -> str:
+    """Return a canonical request path prefix without a trailing slash."""
+    if path in {None, "", "/"}:
+        return ""
+    return f"/{path.strip('/')}"
+
+
+def route_path(base_path: str, endpoint: str) -> str:
+    """Build an absolute request path rooted at *base_path*."""
+    normalized_base = normalize_base_path(base_path)
+    if endpoint == "/":
+        return "/" if not normalized_base else f"{normalized_base}/"
+    return f"{normalized_base}{endpoint}" if normalized_base else endpoint
+
+
+def strip_base_path(request_path: str, base_path: str) -> str | None:
+    """Return *request_path* relative to *base_path*, or ``None`` if it does not match."""
+    normalized_base = normalize_base_path(base_path)
+    if not normalized_base:
+        return request_path
+    if request_path == normalized_base:
+        return "/"
+    prefix = f"{normalized_base}/"
+    if not request_path.startswith(prefix):
+        return None
+    suffix = request_path[len(normalized_base):]
+    return suffix or "/"
 
 
 # ── Request handler ──────────────────────────────────────────────────────────
@@ -132,6 +171,7 @@ class _Handler(BaseHTTPRequestHandler):
     shutdown_event: threading.Event | None = None
     auto_close: bool = False
     share_url: str | None = None
+    base_path: str = ""
     last_heartbeat: float = 0.0
 
     # Silence default request logging
@@ -142,21 +182,29 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
-        if path == "/":
+        if self.base_path and path == self.base_path:
+            self.send_response(HTTPStatus.PERMANENT_REDIRECT)
+            self.send_header("Location", route_path(self.base_path, "/"))
+            self.end_headers()
+            return
+
+        inner_path = strip_base_path(path, self.base_path)
+        if inner_path == "/":
             self._serve_viewer()
-        elif path == "/structure":
+        elif inner_path == "/structure":
             self._serve_structure()
-        elif path in _VENDORED_ASSETS:
-            self._serve_asset(path)
-        elif path == "/heartbeat":
+        elif inner_path in _VENDORED_ASSETS:
+            self._serve_asset(inner_path)
+        elif inner_path == "/heartbeat":
             self._serve_heartbeat()
-        elif path == "/bye":
+        elif inner_path == "/bye":
             self._serve_bye()
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:  # noqa: N802
-        if urlparse(self.path).path == "/bye":
+        path = urlparse(self.path).path
+        if strip_base_path(path, self.base_path) == "/bye":
             self._serve_bye()
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -168,9 +216,14 @@ class _Handler(BaseHTTPRequestHandler):
             type(self).html_cache = render_viewer_html(
                 structure_name=self.structure_source.display_name,
                 format_key=self.structure_source.format_key,
-                file_url="/structure",
+                file_url=route_path(self.base_path, "/structure"),
                 auto_close=self.auto_close,
                 share_url=self.share_url,
+                molstar_css_url=route_path(self.base_path, "/assets/molstar-4.5.0.css"),
+                molstar_js_url=route_path(self.base_path, "/assets/molstar-4.5.0.js"),
+                qrcode_js_url=route_path(self.base_path, "/assets/qrcode-generator-2.0.4.min.js"),
+                heartbeat_url=route_path(self.base_path, "/heartbeat"),
+                bye_url=route_path(self.base_path, "/bye"),
             )
         body = self.html_cache.encode()  # type: ignore[union-attr]
         self.send_response(HTTPStatus.OK)
@@ -318,6 +371,7 @@ def make_server(
     shutdown_event: threading.Event | None = None,
     auto_close: bool = False,
     share_url: str | None = None,
+    base_path: str = "",
 ) -> HTTPServer:
     """Create (but don't start) an HTTPServer for *structure_path*."""
     handler = type("Handler", (_Handler,), {
@@ -326,6 +380,7 @@ def make_server(
         "shutdown_event": shutdown_event,
         "auto_close": auto_close,
         "share_url": share_url,
+        "base_path": normalize_base_path(base_path),
         "last_heartbeat": time.monotonic(),
     })
     server = ThreadingHTTPServer((host, port), handler)

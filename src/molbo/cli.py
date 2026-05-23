@@ -20,6 +20,8 @@ from molbo.server import (
     display_name_from_url,
     format_host_for_url,
     make_server,
+    normalize_base_path,
+    route_path,
     serve_background,
     start_heartbeat_watchdog,
 )
@@ -78,19 +80,24 @@ def _looks_like_pdb_id(value: str) -> bool:
     return _PDB_ID_RE.fullmatch(value) is not None
 
 
-def _normalize_base_url(value: str | None) -> str | None:
+def _viewer_url(origin: str, base_path: str) -> str:
+    normalized_base_path = normalize_base_path(base_path)
+    return f"{origin}{route_path(normalized_base_path, '/')}" if normalized_base_path else origin
+
+
+def _normalize_base_url(value: str | None) -> tuple[str | None, str]:
     if value is None:
-        return None
+        return None, ""
 
     parsed = urlparse(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise typer.BadParameter("Base URL must be an absolute http(s) URL.")
     if parsed.params or parsed.query or parsed.fragment:
         raise typer.BadParameter("Base URL must not include params, query, or fragment components.")
-    if parsed.path not in {"", "/"}:
-        raise typer.BadParameter("Base URL must point to the viewer root, not a path prefix.")
 
-    return f"{parsed.scheme}://{parsed.netloc}"
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    base_path = normalize_base_path(parsed.path)
+    return _viewer_url(origin, base_path), base_path
 
 
 def _pdb_id_to_structure_source(
@@ -243,7 +250,7 @@ def view(
         Optional[str],
         typer.Option(
             "--base-url",
-            help="Public viewer URL to display and encode in the QR modal, e.g. https://mol.example.com.",
+            help="Public viewer URL to display and encode in the QR modal, e.g. https://mol.example.com or https://mol.example.com/s/demo.",
         ),
     ] = None,
     version: Annotated[  # noqa: ARG001
@@ -253,7 +260,7 @@ def view(
 ) -> None:
     """Open a molecular structure in the Mol* 3D viewer."""
 
-    base_url = _normalize_base_url(base_url)
+    base_url, base_path = _normalize_base_url(base_url)
     format_override = format_override.lower() if format_override is not None else None
 
     # ── Validate extension ───────────────────────────────────────────────
@@ -283,6 +290,7 @@ def view(
             shutdown_event=shutdown_event,
             auto_close=effective_auto_close,
             share_url=base_url,
+            base_path=base_path,
         )
     except OSError as exc:
         port_label = str(port) if port is not None else "auto"
@@ -293,7 +301,8 @@ def view(
         raise typer.Exit(code=1) from exc
 
     chosen_port = server.server_address[1]
-    local_url = f"http://{format_host_for_url(host)}:{chosen_port}"
+    local_origin = f"http://{format_host_for_url(host)}:{chosen_port}"
+    local_url = _viewer_url(local_origin, base_path)
     share_url = base_url or local_url
 
     # Pretty banner
