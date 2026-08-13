@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --locked --group dev
+
+      - name: Check lockfile
+        run: uv lock --check
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Run tests
+        run: uv run python -m unittest discover -s tests -v
+
+  package:
+    name: Package and documentation
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --locked --group dev
+
+      - name: Build documentation
+        run: uv run zensical build
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Install wheel in clean environment
+        run: |
+          uv venv /tmp/molbo-wheel-smoke --python 3.12
+          uv pip install --python /tmp/molbo-wheel-smoke/bin/python dist/*.whl
+
+      - name: Smoke-test installed wheel
+        run: |
+          /tmp/molbo-wheel-smoke/bin/molbo --version
+          /tmp/molbo-wheel-smoke/bin/python -c "from importlib.resources import files; assert files('molbo').joinpath('viewer.html').is_file()"
+          /tmp/molbo-wheel-smoke/bin/python -c "from importlib.metadata import requires; assert not any('zensical' in dependency for dependency in requires('molbo') or [])"
