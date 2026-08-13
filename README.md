@@ -28,4 +28,4 @@ Read [the documentation](https://leightonpayne.github.io/molbo/) for more inform
 
 ## License
 
-`molbo` is released under the [MIT license](https://choosealicense.com/licenses/mit/). The package also vendors frontend assets available under the [MIT license](https://choosealicense.com/licenses/mit/). See `src/molbo/vendor/LICENSE-molstar` and `src/molbo/vendor/LICENSE-qrcode-generator` for more information.
+`molbo` is released under the [MIT license](LICENSE). The package also vendors frontend assets available under the MIT license. See `src/molbo/vendor/LICENSE-molstar` and `src/molbo/vendor/LICENSE-qrcode-generator` for more information.

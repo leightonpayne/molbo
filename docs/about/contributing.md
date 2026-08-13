@@ -17,6 +17,8 @@ Contributions to `molbo` are welcome.
 | Command                 | Description                 |
 | ----------------------- | --------------------------- |
 | `uv run python -m unittest discover -s tests -v` | Run tests |
+| `uv run ruff check .` | Run lint checks |
+| `uv run ruff format --check .` | Check formatting |
 | `uv run zensical serve` | Serve docs locally |
 | `uv run zensical build` | Build docs locally |
 | `uv build` | Build sdist and wheel |
