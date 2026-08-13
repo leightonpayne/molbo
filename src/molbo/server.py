@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import lru_cache
 import html
 import json
 import mimetypes
 import threading
 import time
+from dataclasses import dataclass
+from functools import lru_cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.resources import files
@@ -34,7 +34,9 @@ class VendoredAsset:
 
 _VENDORED_ASSETS: dict[str, VendoredAsset] = {
     "/assets/molstar-4.5.0.css": VendoredAsset("molstar-4.5.0.css", "text/css; charset=utf-8"),
-    "/assets/molstar-4.5.0.js": VendoredAsset("molstar-4.5.0.js", "application/javascript; charset=utf-8"),
+    "/assets/molstar-4.5.0.js": VendoredAsset(
+        "molstar-4.5.0.js", "application/javascript; charset=utf-8"
+    ),
     "/assets/qrcode-generator-2.0.4.min.js": VendoredAsset(
         "qrcode-generator-2.0.4.min.js",
         "application/javascript; charset=utf-8",
@@ -48,6 +50,12 @@ _EXTRA_MIMES: dict[str, str] = {
     ".cif": "chemical/x-cif",
     ".mmcif": "chemical/x-mmcif",
     ".bcif": "application/octet-stream",
+}
+_FORMAT_MIMES: dict[str, str] = {
+    "pdb": "chemical/x-pdb",
+    "cif": "chemical/x-cif",
+    "mmcif": "chemical/x-mmcif",
+    "bcif": "application/octet-stream",
 }
 
 
@@ -71,13 +79,14 @@ def _load_vendored_asset(package_name: str) -> bytes:
     return files("molbo").joinpath("vendor", package_name).read_bytes()
 
 
-def _guess_mime(name: str) -> str:
+def _guess_mime(name: str, format_key: str | None = None) -> str:
     suffixes = [suffix.lower() for suffix in Path(name).suffixes]
-    ext = suffixes[-2] if suffixes[-1:] == [".gz"] and len(suffixes) >= 2 else suffixes[-1]
-    if ext in _EXTRA_MIMES:
-        return _EXTRA_MIMES[ext]
+    if suffixes:
+        ext = suffixes[-2] if suffixes[-1:] == [".gz"] and len(suffixes) >= 2 else suffixes[-1]
+        if ext in _EXTRA_MIMES:
+            return _EXTRA_MIMES[ext]
     mime, _ = mimetypes.guess_type(name.removesuffix(".gz"))
-    return mime or "application/octet-stream"
+    return mime or _FORMAT_MIMES.get(format_key or "", "application/octet-stream")
 
 
 def _guess_content_encoding(name: str) -> str | None:
@@ -156,7 +165,7 @@ def strip_base_path(request_path: str, base_path: str) -> str | None:
     prefix = f"{normalized_base}/"
     if not request_path.startswith(prefix):
         return None
-    suffix = request_path[len(normalized_base):]
+    suffix = request_path[len(normalized_base) :]
     return suffix or "/"
 
 
@@ -258,7 +267,10 @@ class _Handler(BaseHTTPRequestHandler):
         except OSError:
             self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Cannot read structure file")
             return
-        mime = _guess_mime(self.structure_source.display_name)
+        mime = _guess_mime(
+            self.structure_source.display_name,
+            format_key=self.structure_source.format_key,
+        )
         content_encoding = _guess_content_encoding(self.structure_source.display_name)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", mime)
@@ -282,13 +294,14 @@ class _Handler(BaseHTTPRequestHandler):
             with self._open_remote_structure() as response:
                 self.send_response(getattr(response, "status", HTTPStatus.OK))
                 content_type = response.headers.get("Content-Type") or _guess_mime(
-                    self.structure_source.display_name
+                    self.structure_source.display_name,
+                    format_key=self.structure_source.format_key,
                 )
                 self.send_header("Content-Type", content_type)
 
-                content_encoding = response.headers.get("Content-Encoding") or _guess_content_encoding(
-                    self.structure_source.display_name
-                )
+                content_encoding = response.headers.get(
+                    "Content-Encoding"
+                ) or _guess_content_encoding(self.structure_source.display_name)
                 if content_encoding is not None:
                     self.send_header("Content-Encoding", content_encoding)
 
@@ -374,15 +387,19 @@ def make_server(
     base_path: str = "",
 ) -> HTTPServer:
     """Create (but don't start) an HTTPServer for *structure_path*."""
-    handler = type("Handler", (_Handler,), {
-        "structure_source": structure_source,
-        "html_cache": None,
-        "shutdown_event": shutdown_event,
-        "auto_close": auto_close,
-        "share_url": share_url,
-        "base_path": normalize_base_path(base_path),
-        "last_heartbeat": time.monotonic(),
-    })
+    handler = type(
+        "Handler",
+        (_Handler,),
+        {
+            "structure_source": structure_source,
+            "html_cache": None,
+            "shutdown_event": shutdown_event,
+            "auto_close": auto_close,
+            "share_url": share_url,
+            "base_path": normalize_base_path(base_path),
+            "last_heartbeat": time.monotonic(),
+        },
+    )
     server = ThreadingHTTPServer((host, port), handler)
     return server
 
@@ -393,6 +410,7 @@ def start_heartbeat_watchdog(
     timeout: float = 1.5,
 ) -> threading.Thread:
     """Monitor heartbeats and trigger shutdown after the idle timeout expires."""
+
     def _watch() -> None:
         while not shutdown_event.is_set():
             elapsed = time.monotonic() - handler_cls.last_heartbeat

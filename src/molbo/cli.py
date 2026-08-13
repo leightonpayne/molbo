@@ -255,7 +255,9 @@ def view(
     ] = None,
     version: Annotated[  # noqa: ARG001
         Optional[bool],
-        typer.Option("--version", "-v", callback=_version_callback, is_eager=True, help="Show version."),
+        typer.Option(
+            "--version", "-v", callback=_version_callback, is_eager=True, help="Show version."
+        ),
     ] = None,
 ) -> None:
     """Open a molecular structure in the Mol* 3D viewer."""
