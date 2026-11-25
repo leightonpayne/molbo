@@ -23,7 +23,7 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _dist_version
 from importlib.resources import files
 from pathlib import Path
-from socketserver import ThreadingMixIn
+from socketserver import TCPServer, ThreadingMixIn
 from typing import Any, Literal, get_args
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlparse
@@ -1048,6 +1048,12 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     """Small threaded HTTP server suitable for local one-user traffic."""
 
     daemon_threads = True
+
+    def server_bind(self) -> None:
+        TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
 
 
 class ThreadingIPv6HTTPServer(ThreadingHTTPServer):
