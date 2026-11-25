@@ -2,34 +2,74 @@
 
 from __future__ import annotations
 
+import gzip
 import html
+import http.client
+import ipaddress
 import json
 import mimetypes
+import os
+import re
+import socket
+import ssl
 import threading
 import time
 from dataclasses import dataclass
-from functools import lru_cache
+from email.message import Message
+from functools import cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from importlib.resources import files
 from pathlib import Path
 from socketserver import ThreadingMixIn
+from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 
 from molbo import __version__
 
 _VIEWER_TEMPLATE = files("molbo").joinpath("viewer.html").read_text(encoding="utf-8")
+_TEMPLATE_PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-z0-9_]+)\s*\}\}")
 _REMOTE_FETCH_ATTEMPTS = 2
 _REMOTE_FETCH_RETRY_DELAY = 0.25
 _STREAM_CHUNK_SIZE = 64 * 1024
+_MAX_REMOTE_CACHE_BYTES = 50 * 1024 * 1024
+_DEFAULT_IDLE_TIMEOUT = 15.0
+_DEFAULT_BYE_GRACE = 2.0
+
+_FAVICON_SVG = (
+    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+    b'<rect width="24" height="24" rx="5" fill="#fcfbf9"/>'
+    b'<circle cx="12" cy="12" r="2.3" fill="#6e5237"/>'
+    b'<ellipse cx="12" cy="12" rx="8.5" ry="3.6" fill="none" stroke="#6e5237" stroke-width="1.5"/>'
+    b'<ellipse cx="12" cy="12" rx="8.5" ry="3.6" fill="none" stroke="#6e5237" stroke-width="1.5" '
+    b'transform="rotate(60 12 12)"/>'
+    b'<ellipse cx="12" cy="12" rx="8.5" ry="3.6" fill="none" stroke="#6e5237" stroke-width="1.5" '
+    b'transform="rotate(120 12 12)"/>'
+    b"</svg>"
+)
+
+_ALPHAFOLD_FORMAT_FIELDS: dict[str, str] = {
+    "cif": "cifUrl",
+    "mmcif": "cifUrl",
+    "pdb": "pdbUrl",
+    "bcif": "bcifUrl",
+}
 
 
 @dataclass(frozen=True)
 class VendoredAsset:
     package_name: str
     content_type: str
+
+
+@dataclass(frozen=True)
+class _CachedRemoteResponse:
+    status: int
+    content_type: str
+    content_encoding: str | None
+    body: bytes
 
 
 _VENDORED_ASSETS: dict[str, VendoredAsset] = {
@@ -43,19 +83,22 @@ _VENDORED_ASSETS: dict[str, VendoredAsset] = {
     ),
 }
 
-# ── MIME helpers ─────────────────────────────────────────────────────────────
-
-_EXTRA_MIMES: dict[str, str] = {
-    ".pdb": "chemical/x-pdb",
-    ".cif": "chemical/x-cif",
-    ".mmcif": "chemical/x-mmcif",
-    ".bcif": "application/octet-stream",
-}
 _FORMAT_MIMES: dict[str, str] = {
     "pdb": "chemical/x-pdb",
+    "pdbqt": "chemical/x-pdb",
     "cif": "chemical/x-cif",
     "mmcif": "chemical/x-mmcif",
     "bcif": "application/octet-stream",
+    "sdf": "chemical/x-mdl-sdfile",
+    "mol": "chemical/x-mdl-molfile",
+    "mol2": "chemical/x-mol2",
+    "xyz": "chemical/x-xyz",
+    "gro": "text/plain; charset=utf-8",
+}
+_EXTRA_MIMES: dict[str, str] = {
+    **{f".{fmt}": mime for fmt, mime in _FORMAT_MIMES.items()},
+    ".ent": _FORMAT_MIMES["pdb"],
+    ".sd": _FORMAT_MIMES["sdf"],
 }
 
 
@@ -68,15 +111,43 @@ class StructureSource:
     local_path: Path | None = None
     remote_url: str | None = None
     fetch_timeout: float = 30.0
+    pdb_id: str | None = None
+    alphafold_id: str | None = None
+    alphafold_api_url: str | None = None
 
     @property
     def is_remote(self) -> bool:
-        return self.remote_url is not None
+        return self.remote_url is not None or self.alphafold_api_url is not None
 
 
-@lru_cache(maxsize=None)
+@cache
 def _load_vendored_asset(package_name: str) -> bytes:
-    return files("molbo").joinpath("vendor", package_name).read_bytes()
+    return files("molbo").joinpath("vendor").joinpath(package_name).read_bytes()
+
+
+@cache
+def _load_vendored_asset_gzip(package_name: str) -> bytes:
+    return gzip.compress(_load_vendored_asset(package_name), compresslevel=6)
+
+
+def _accepts_gzip(header_value: str | None) -> bool:
+    """Return True if the HTTP Accept-Encoding header permits gzip."""
+    if not header_value:
+        return False
+    for part in header_value.split(","):
+        tokens = [token.strip().lower() for token in part.split(";") if token.strip()]
+        if not tokens or tokens[0] != "gzip":
+            continue
+        q_value = 1.0
+        for param in tokens[1:]:
+            if param.startswith("q="):
+                try:
+                    q_value = float(param[2:])
+                except ValueError:
+                    q_value = 0.0
+        if q_value > 0.0:
+            return True
+    return False
 
 
 def _guess_mime(name: str, format_key: str | None = None) -> str:
@@ -93,11 +164,70 @@ def _guess_content_encoding(name: str) -> str | None:
     return "gzip" if name.lower().endswith(".gz") else None
 
 
+def local_file_signature(path: Path) -> str | None:
+    """Return a lightweight change signature for a local file, or ``None`` if unavailable."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return f"{st.st_mtime_ns}:{st.st_size}"
+
+
+def _json_for_script(value: object) -> str:
+    """Serialize *value* as JSON safe for embedding inside an HTML ``<script>`` tag."""
+    return (
+        json.dumps(value)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    return isinstance(exc, URLError) and isinstance(exc.reason, TimeoutError)
+
+
+def _is_non_retryable_url_error(exc: URLError) -> bool:
+    return isinstance(exc.reason, ssl.SSLError)
+
+
 def format_host_for_url(host: str) -> str:
     """Return *host* in a form suitable for an http:// URL."""
-    if ":" in host and not host.startswith("["):
-        return f"[{host}]"
-    return host
+    stripped = host.strip("[]")
+    if ":" in stripped:
+        return f"[{stripped}]"
+    return stripped
+
+
+def local_access_host(host: str) -> str:
+    """Return a locally routable host for opening a browser when binding wildcard addresses."""
+    stripped = host.strip("[]")
+    if stripped in {"", "0.0.0.0"}:
+        return "127.0.0.1"
+    if stripped == "::":
+        return "::1"
+    return stripped
+
+
+def _resolve_address_family(host: str) -> socket.AddressFamily:
+    stripped = host.strip("[]")
+    if not stripped:
+        return socket.AF_INET
+    try:
+        address = ipaddress.ip_address(stripped)
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(stripped, None, type=socket.SOCK_STREAM)
+        except OSError:
+            return socket.AF_INET
+        if infos and all(info[0] == socket.AF_INET6 for info in infos):
+            return socket.AF_INET6
+        return socket.AF_INET
+    return socket.AF_INET6 if address.version == 6 else socket.AF_INET
 
 
 def display_name_from_url(url: str) -> str:
@@ -105,6 +235,11 @@ def display_name_from_url(url: str) -> str:
     parsed = urlparse(url)
     path_name = Path(unquote(parsed.path)).name
     return path_name or parsed.netloc or "remote-structure"
+
+
+def compute_heartbeat_interval_ms(idle_timeout: float) -> int:
+    """Compute a client heartbeat interval shorter than *idle_timeout*."""
+    return min(5000, max(250, int(idle_timeout * 1000 / 3)))
 
 
 def render_viewer_html(
@@ -118,26 +253,36 @@ def render_viewer_html(
     qrcode_js_url: str = "/assets/qrcode-generator-2.0.4.min.js",
     heartbeat_url: str = "/heartbeat",
     bye_url: str = "/bye",
+    heartbeat_interval_ms: int = 5000,
+    watch: bool = False,
+    version_url: str = "/version",
+    favicon_url: str = "/favicon.ico",
 ) -> str:
-    """Render the viewer template with escaped HTML and JSON-safe script values."""
+    """Render the viewer template with escaped HTML and script-safe JSON values."""
     replacements = {
-        "{{ title_html }}": html.escape(structure_name, quote=True),
-        "{{ filename_html }}": html.escape(structure_name, quote=True),
-        "{{ format_label_html }}": html.escape(format_key, quote=True),
-        "{{ molstar_css_url_html }}": html.escape(molstar_css_url, quote=True),
-        "{{ molstar_js_url_html }}": html.escape(molstar_js_url, quote=True),
-        "{{ qrcode_js_url_html }}": html.escape(qrcode_js_url, quote=True),
-        "{{ format_json }}": json.dumps(format_key),
-        "{{ file_url_json }}": json.dumps(file_url),
-        "{{ auto_close_json }}": json.dumps(auto_close),
-        "{{ share_url_json }}": json.dumps(share_url),
-        "{{ heartbeat_url_json }}": json.dumps(heartbeat_url),
-        "{{ bye_url_json }}": json.dumps(bye_url),
+        "title_html": html.escape(structure_name, quote=True),
+        "filename_html": html.escape(structure_name, quote=True),
+        "favicon_url_html": html.escape(favicon_url, quote=True),
+        "molstar_css_url_html": html.escape(molstar_css_url, quote=True),
+        "molstar_js_url_html": html.escape(molstar_js_url, quote=True),
+        "qrcode_js_url_html": html.escape(qrcode_js_url, quote=True),
+        "structure_name_json": _json_for_script(structure_name),
+        "format_json": _json_for_script(format_key),
+        "file_url_json": _json_for_script(file_url),
+        "auto_close_json": _json_for_script(auto_close),
+        "share_url_json": _json_for_script(share_url),
+        "heartbeat_url_json": _json_for_script(heartbeat_url),
+        "bye_url_json": _json_for_script(bye_url),
+        "heartbeat_interval_ms_json": _json_for_script(heartbeat_interval_ms),
+        "watch_json": _json_for_script(watch),
+        "version_url_json": _json_for_script(version_url),
     }
-    rendered = _VIEWER_TEMPLATE
-    for placeholder, value in replacements.items():
-        rendered = rendered.replace(placeholder, value)
-    return rendered
+
+    def _replace(match: re.Match[str]) -> str:
+        key = match.group(1)
+        return replacements.get(key, match.group(0))
+
+    return _TEMPLATE_PLACEHOLDER_RE.sub(_replace, _VIEWER_TEMPLATE)
 
 
 def normalize_base_path(path: str | None) -> str:
@@ -169,171 +314,343 @@ def strip_base_path(request_path: str, base_path: str) -> str | None:
     return suffix or "/"
 
 
-# ── Request handler ──────────────────────────────────────────────────────────
-
-
 class _Handler(BaseHTTPRequestHandler):
-    """Serves exactly two endpoints: ``/`` (viewer) and ``/structure`` (file)."""
+    """Serves the viewer page, structure file, vendored assets, and session lifecycle endpoints."""
 
     structure_source: StructureSource
-    html_cache: str | None = None
+    viewer_html_bytes: bytes = b""
     shutdown_event: threading.Event | None = None
     auto_close: bool = False
-    share_url: str | None = None
     base_path: str = ""
+    idle_timeout: float = _DEFAULT_IDLE_TIMEOUT
+    bye_grace: float = _DEFAULT_BYE_GRACE
     last_heartbeat: float = 0.0
+    activity_seq: int = 0
+    active_clients: dict[str, float]
+    state_lock: threading.Lock
+    remote_cache: _CachedRemoteResponse | None = None
+    remote_cache_lock: threading.Lock
 
-    # Silence default request logging
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         pass
 
-    # ── routing ──────────────────────────────────────────────────────────
-
     def do_GET(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path
+        self._dispatch_get_or_head(send_body=True)
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self._dispatch_get_or_head(send_body=False)
+
+    def _dispatch_get_or_head(self, *, send_body: bool) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/favicon.ico":
+            self._serve_favicon(send_body=send_body)
+            return
+
         if self.base_path and path == self.base_path:
             self.send_response(HTTPStatus.PERMANENT_REDIRECT)
             self.send_header("Location", route_path(self.base_path, "/"))
+            self.send_header("Content-Length", "0")
             self.end_headers()
             return
 
         inner_path = strip_base_path(path, self.base_path)
         if inner_path == "/":
-            self._serve_viewer()
+            self._record_activity()
+            self._serve_viewer(send_body=send_body)
         elif inner_path == "/structure":
-            self._serve_structure()
+            self._record_activity()
+            refresh = parse_qs(parsed.query).get("refresh", [""])[0] in {"1", "true"}
+            self._serve_structure(send_body=send_body, force_refresh=refresh)
+        elif inner_path == "/version":
+            self._serve_version(send_body=send_body)
+        elif inner_path == "/favicon.ico":
+            self._serve_favicon(send_body=send_body)
         elif inner_path in _VENDORED_ASSETS:
-            self._serve_asset(inner_path)
+            self._record_activity()
+            self._serve_asset(inner_path, send_body=send_body)
         elif inner_path == "/heartbeat":
-            self._serve_heartbeat()
+            self._serve_heartbeat(parsed.query)
         elif inner_path == "/bye":
-            self._serve_bye()
+            self._serve_bye(parsed.query)
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path
-        if strip_base_path(path, self.base_path) == "/bye":
-            self._serve_bye()
+        parsed = urlparse(self.path)
+        if strip_base_path(parsed.path, self.base_path) == "/bye":
+            self._serve_bye(parsed.query)
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
-    # ── viewer page ──────────────────────────────────────────────────────
-
-    def _serve_viewer(self) -> None:
-        if self.html_cache is None:
-            type(self).html_cache = render_viewer_html(
-                structure_name=self.structure_source.display_name,
-                format_key=self.structure_source.format_key,
-                file_url=route_path(self.base_path, "/structure"),
-                auto_close=self.auto_close,
-                share_url=self.share_url,
-                molstar_css_url=route_path(self.base_path, "/assets/molstar-4.5.0.css"),
-                molstar_js_url=route_path(self.base_path, "/assets/molstar-4.5.0.js"),
-                qrcode_js_url=route_path(self.base_path, "/assets/qrcode-generator-2.0.4.min.js"),
-                heartbeat_url=route_path(self.base_path, "/heartbeat"),
-                bye_url=route_path(self.base_path, "/bye"),
-            )
-        body = self.html_cache.encode()  # type: ignore[union-attr]
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+    def _send_bytes(
+        self,
+        body: bytes,
+        content_type: str,
+        *,
+        status: int = HTTPStatus.OK,
+        send_body: bool = True,
+        headers: dict[str, str] | None = None,
+        cors: bool = False,
+    ) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        if headers:
+            for key, value in headers.items():
+                self.send_header(key, value)
         self.send_header("Content-Length", str(len(body)))
-        self._cors_headers()
+        if cors:
+            self._cors_headers()
         self.end_headers()
-        self.wfile.write(body)
-
-    # ── structure file ───────────────────────────────────────────────────
-
-    def _serve_structure(self) -> None:
-        if self.structure_source.is_remote:
-            self._serve_remote_structure()
+        if not send_body:
             return
-        self._serve_local_structure()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
-    def _serve_asset(self, path: str) -> None:
+    def _serve_viewer(self, *, send_body: bool = True) -> None:
+        self._send_bytes(
+            self.viewer_html_bytes,
+            "text/html; charset=utf-8",
+            send_body=send_body,
+            cors=True,
+        )
+
+    def _serve_favicon(self, *, send_body: bool = True) -> None:
+        self._send_bytes(
+            _FAVICON_SVG,
+            "image/svg+xml",
+            send_body=send_body,
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    def _serve_version(self, *, send_body: bool = True) -> None:
+        version_token: str | None = None
+        if self.structure_source.local_path is not None:
+            version_token = local_file_signature(self.structure_source.local_path)
+        body = json.dumps({"version": version_token}).encode("utf-8")
+        self._send_bytes(
+            body,
+            "application/json; charset=utf-8",
+            send_body=send_body,
+            cors=True,
+        )
+
+    def _serve_structure(self, *, send_body: bool = True, force_refresh: bool = False) -> None:
+        if self.structure_source.is_remote:
+            self._serve_remote_structure(send_body=send_body, force_refresh=force_refresh)
+            return
+        self._serve_local_structure(send_body=send_body)
+
+    def _serve_asset(self, path: str, *, send_body: bool = True) -> None:
         asset = _VENDORED_ASSETS[path]
-        body = _load_vendored_asset(asset.package_name)
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", asset.content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
-        self.end_headers()
-        self.wfile.write(body)
+        use_gzip = _accepts_gzip(self.headers.get("Accept-Encoding"))
+        body = (
+            _load_vendored_asset_gzip(asset.package_name)
+            if use_gzip
+            else _load_vendored_asset(asset.package_name)
+        )
+        headers = {
+            "Vary": "Accept-Encoding",
+            "Cache-Control": "public, max-age=31536000, immutable",
+        }
+        if use_gzip:
+            headers["Content-Encoding"] = "gzip"
+        self._send_bytes(body, asset.content_type, send_body=send_body, headers=headers)
 
-    def _serve_local_structure(self) -> None:
+    def _serve_local_structure(self, *, send_body: bool = True) -> None:
         assert self.structure_source.local_path is not None
         try:
-            size = self.structure_source.local_path.stat().st_size
+            handle = self.structure_source.local_path.open("rb")
         except OSError:
             self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Cannot read structure file")
             return
-        mime = _guess_mime(
-            self.structure_source.display_name,
-            format_key=self.structure_source.format_key,
-        )
-        content_encoding = _guess_content_encoding(self.structure_source.display_name)
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", mime)
-        if content_encoding is not None:
-            self.send_header("Content-Encoding", content_encoding)
-        self.send_header("Content-Length", str(size))
-        self._cors_headers()
-        self.end_headers()
-        try:
-            with self.structure_source.local_path.open("rb") as handle:
+
+        with handle:
+            try:
+                size = os.fstat(handle.fileno()).st_size
+            except OSError:
+                self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Cannot read structure file")
+                return
+
+            mime = _guess_mime(
+                self.structure_source.display_name,
+                format_key=self.structure_source.format_key,
+            )
+            content_encoding = _guess_content_encoding(self.structure_source.display_name)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", mime)
+            if content_encoding is not None:
+                self.send_header("Content-Encoding", content_encoding)
+            self.send_header("Content-Length", str(size))
+            self._cors_headers()
+            self.end_headers()
+            if not send_body:
+                return
+            try:
                 while chunk := handle.read(_STREAM_CHUNK_SIZE):
                     self.wfile.write(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            return
-        except OSError:
-            self.close_connection = True
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except OSError:
+                self.close_connection = True
 
-    def _serve_remote_structure(self) -> None:
-        assert self.structure_source.remote_url is not None
+    def _serve_cached_remote(
+        self,
+        cached: _CachedRemoteResponse,
+        *,
+        send_body: bool,
+    ) -> None:
+        headers = {"Content-Encoding": cached.content_encoding} if cached.content_encoding else None
+        self._send_bytes(
+            cached.body,
+            cached.content_type,
+            status=cached.status,
+            send_body=send_body,
+            headers=headers,
+            cors=True,
+        )
+
+    def _resolve_remote_url(self) -> str:
+        if self.structure_source.remote_url is not None:
+            return self.structure_source.remote_url
+
+        api_url = self.structure_source.alphafold_api_url
+        assert api_url is not None
+        with self._open_url(api_url, accept="application/json") as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        if not isinstance(payload, list) or not payload:
+            raise HTTPError(
+                api_url, HTTPStatus.NOT_FOUND, "AlphaFold DB entry not found", Message(), None
+            )
+
+        target_entry: dict[str, Any] | None = None
+        af_id = (self.structure_source.alphafold_id or "").upper()
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            entry_id = str(item.get("entryId", "")).upper()
+            if af_id and entry_id == af_id:
+                target_entry = item
+                break
+        if target_entry is None:
+            first = payload[0]
+            if isinstance(first, dict):
+                target_entry = first
+
+        field = _ALPHAFOLD_FORMAT_FIELDS.get(self.structure_source.format_key, "cifUrl")
+        resolved_url = target_entry.get(field) if target_entry is not None else None
+        if not isinstance(resolved_url, str) or not resolved_url:
+            raise HTTPError(
+                api_url,
+                HTTPStatus.NOT_FOUND,
+                f"AlphaFold DB does not provide a {self.structure_source.format_key} URL for this entry",
+                Message(),
+                None,
+            )
+        return resolved_url
+
+    def _serve_remote_structure(
+        self,
+        *,
+        send_body: bool = True,
+        force_refresh: bool = False,
+    ) -> None:
+        cls = type(self)
+        if not force_refresh:
+            with cls.remote_cache_lock:
+                cached = cls.remote_cache
+            if cached is not None:
+                self._serve_cached_remote(cached, send_body=send_body)
+                return
+
         try:
-            with self._open_remote_structure() as response:
-                self.send_response(getattr(response, "status", HTTPStatus.OK))
-                content_type = response.headers.get("Content-Type") or _guess_mime(
-                    self.structure_source.display_name,
-                    format_key=self.structure_source.format_key,
-                )
-                self.send_header("Content-Type", content_type)
-
-                content_encoding = response.headers.get(
-                    "Content-Encoding"
-                ) or _guess_content_encoding(self.structure_source.display_name)
-                if content_encoding is not None:
-                    self.send_header("Content-Encoding", content_encoding)
-
-                content_length = response.headers.get("Content-Length")
-                if content_length is not None:
-                    self.send_header("Content-Length", content_length)
-
-                self._cors_headers()
-                self.end_headers()
-
-                while chunk := response.read(_STREAM_CHUNK_SIZE):
-                    self.wfile.write(chunk)
+            resolved_url = self._resolve_remote_url()
+            response = self._open_url(resolved_url)
         except HTTPError as exc:
             detail = str(exc.reason) if exc.reason else "request failed"
             self.send_error(exc.code, f"Upstream server returned {exc.code}: {detail}")
-        except TimeoutError:
-            self.send_error(HTTPStatus.GATEWAY_TIMEOUT, "Remote structure request timed out")
-        except URLError as exc:
-            detail = str(exc.reason) if exc.reason else "connection failed"
+            return
+        except (TimeoutError, URLError) as exc:
+            if _is_timeout_error(exc):
+                self.send_error(HTTPStatus.GATEWAY_TIMEOUT, "Remote structure request timed out")
+                return
+            reason = exc.reason if isinstance(exc, URLError) else exc
+            detail = str(reason) if reason else "connection failed"
             self.send_error(HTTPStatus.BAD_GATEWAY, f"Failed to fetch remote structure: {detail}")
-        except (BrokenPipeError, ConnectionResetError):
+            return
+        except (ValueError, UnicodeDecodeError) as exc:
+            self.send_error(HTTPStatus.BAD_GATEWAY, f"Invalid metadata from upstream: {exc}")
             return
 
-    def _open_remote_structure(self):
-        assert self.structure_source.remote_url is not None
+        with response:
+            status = getattr(response, "status", HTTPStatus.OK)
+            content_type = response.headers.get("Content-Type") or _guess_mime(
+                self.structure_source.display_name,
+                format_key=self.structure_source.format_key,
+            )
+            content_encoding = response.headers.get("Content-Encoding") or _guess_content_encoding(
+                self.structure_source.display_name
+            )
+            content_length = response.headers.get("Content-Length")
+
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            if content_encoding is not None:
+                self.send_header("Content-Encoding", content_encoding)
+            if content_length is not None:
+                self.send_header("Content-Length", content_length)
+            self._cors_headers()
+            self.end_headers()
+            if not send_body:
+                return
+
+            chunks: list[bytes] | None = [] if status == HTTPStatus.OK else None
+            cached_bytes = 0
+            completed = False
+            try:
+                while chunk := response.read(_STREAM_CHUNK_SIZE):
+                    self.wfile.write(chunk)
+                    if chunks is not None:
+                        cached_bytes += len(chunk)
+                        if cached_bytes <= _MAX_REMOTE_CACHE_BYTES:
+                            chunks.append(chunk)
+                        else:
+                            chunks = None
+                completed = True
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except (OSError, http.client.HTTPException):
+                self.close_connection = True
+                return
+
+            if completed and chunks is not None:
+                body = b"".join(chunks)
+                expected_length: int | None = None
+                if content_length is not None:
+                    try:
+                        expected_length = int(content_length)
+                    except ValueError:
+                        expected_length = None
+                if expected_length is None or len(body) == expected_length:
+                    with cls.remote_cache_lock:
+                        cls.remote_cache = _CachedRemoteResponse(
+                            status=status,
+                            content_type=content_type,
+                            content_encoding=content_encoding,
+                            body=body,
+                        )
+
+    def _open_url(self, url: str, *, accept: str = "*/*") -> Any:
         last_error: URLError | TimeoutError | None = None
         for attempt in range(_REMOTE_FETCH_ATTEMPTS):
             request = Request(
-                self.structure_source.remote_url,
+                url,
                 headers={
                     "User-Agent": f"molbo/{__version__}",
-                    "Accept": "*/*",
+                    "Accept": accept,
                 },
             )
             try:
@@ -342,29 +659,77 @@ class _Handler(BaseHTTPRequestHandler):
                 raise
             except (TimeoutError, URLError) as exc:
                 last_error = exc
+                if isinstance(exc, URLError) and _is_non_retryable_url_error(exc):
+                    raise
                 if attempt + 1 == _REMOTE_FETCH_ATTEMPTS:
                     raise
                 time.sleep(_REMOTE_FETCH_RETRY_DELAY * (attempt + 1))
 
         raise RuntimeError(f"unreachable remote fetch state: {last_error}")
 
-    # ── helpers ──────────────────────────────────────────────────────────
+    def _extract_client_id(self, query: str) -> str | None:
+        values = parse_qs(query).get("client")
+        if not values:
+            return None
+        client_id = values[0].strip()
+        return client_id or None
 
-    # ── heartbeat ────────────────────────────────────────────────────────
+    def _record_activity(self, client_id: str | None = None) -> None:
+        cls = type(self)
+        now = time.monotonic()
+        with cls.state_lock:
+            cls.last_heartbeat = now
+            cls.activity_seq += 1
+            if client_id is not None:
+                cls.active_clients[client_id] = now
 
-    def _serve_heartbeat(self) -> None:
-        type(self).last_heartbeat = time.monotonic()
+    def _serve_heartbeat(self, query: str = "") -> None:
+        client_id = self._extract_client_id(query)
+        self._record_activity(client_id=client_id)
         self.send_response(HTTPStatus.NO_CONTENT)
         self._cors_headers()
         self.end_headers()
 
-    def _serve_bye(self) -> None:
-        """Immediate shutdown triggered by browser tab close."""
+    def _serve_bye(self, query: str = "") -> None:
+        """Schedule shutdown when the last active browser tab closes."""
+        client_id = self._extract_client_id(query)
         self.send_response(HTTPStatus.NO_CONTENT)
         self._cors_headers()
         self.end_headers()
-        if self.auto_close and self.shutdown_event is not None:
+        if not self.auto_close or self.shutdown_event is None:
+            return
+
+        cls = type(self)
+        now = time.monotonic()
+        with cls.state_lock:
+            stale_ids = [
+                cid
+                for cid, last_seen in cls.active_clients.items()
+                if now - last_seen > cls.idle_timeout
+            ]
+            for cid in stale_ids:
+                del cls.active_clients[cid]
+            if client_id is not None:
+                cls.active_clients.pop(client_id, None)
+            if cls.active_clients:
+                return
+            seq = cls.activity_seq
+
+        if cls.bye_grace <= 0:
             self.shutdown_event.set()
+            return
+
+        shutdown_event = self.shutdown_event
+
+        def _finish_bye() -> None:
+            with cls.state_lock:
+                if cls.activity_seq != seq or cls.active_clients:
+                    return
+            shutdown_event.set()
+
+        timer = threading.Timer(cls.bye_grace, _finish_bye)
+        timer.daemon = True
+        timer.start()
 
     def _cors_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -377,6 +742,12 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
+class ThreadingIPv6HTTPServer(ThreadingHTTPServer):
+    """Threaded HTTP server configured for IPv6 addresses."""
+
+    address_family = socket.AF_INET6
+
+
 def make_server(
     structure_source: StructureSource,
     port: int,
@@ -385,39 +756,78 @@ def make_server(
     auto_close: bool = False,
     share_url: str | None = None,
     base_path: str = "",
+    idle_timeout: float = _DEFAULT_IDLE_TIMEOUT,
+    bye_grace: float = _DEFAULT_BYE_GRACE,
+    watch: bool = False,
 ) -> HTTPServer:
-    """Create (but don't start) an HTTPServer for *structure_path*."""
-    handler = type(
+    """Create (but don't start) an HTTPServer for *structure_source*."""
+    normalized_base_path = normalize_base_path(base_path)
+    viewer_html_bytes = render_viewer_html(
+        structure_name=structure_source.display_name,
+        format_key=structure_source.format_key,
+        file_url=route_path(normalized_base_path, "/structure"),
+        auto_close=auto_close,
+        share_url=share_url,
+        molstar_css_url=route_path(normalized_base_path, "/assets/molstar-4.5.0.css"),
+        molstar_js_url=route_path(normalized_base_path, "/assets/molstar-4.5.0.js"),
+        qrcode_js_url=route_path(normalized_base_path, "/assets/qrcode-generator-2.0.4.min.js"),
+        heartbeat_url=route_path(normalized_base_path, "/heartbeat"),
+        bye_url=route_path(normalized_base_path, "/bye"),
+        heartbeat_interval_ms=compute_heartbeat_interval_ms(idle_timeout),
+        watch=watch,
+        version_url=route_path(normalized_base_path, "/version"),
+        favicon_url=route_path(normalized_base_path, "/favicon.ico"),
+    ).encode("utf-8")
+
+    handler: type[BaseHTTPRequestHandler] = type(
         "Handler",
         (_Handler,),
         {
             "structure_source": structure_source,
-            "html_cache": None,
+            "viewer_html_bytes": viewer_html_bytes,
             "shutdown_event": shutdown_event,
             "auto_close": auto_close,
-            "share_url": share_url,
-            "base_path": normalize_base_path(base_path),
+            "base_path": normalized_base_path,
+            "idle_timeout": idle_timeout,
+            "bye_grace": bye_grace,
             "last_heartbeat": time.monotonic(),
+            "activity_seq": 0,
+            "active_clients": {},
+            "state_lock": threading.Lock(),
+            "remote_cache": None,
+            "remote_cache_lock": threading.Lock(),
         },
     )
-    server = ThreadingHTTPServer((host, port), handler)
-    return server
+
+    bind_host = host.strip("[]")
+    family = _resolve_address_family(bind_host)
+    server_cls: type[HTTPServer] = (
+        ThreadingIPv6HTTPServer if family == socket.AF_INET6 else ThreadingHTTPServer
+    )
+    return server_cls((bind_host, port), handler)
 
 
 def start_heartbeat_watchdog(
-    handler_cls: type,
+    handler_cls: Any,
     shutdown_event: threading.Event,
-    timeout: float = 1.5,
+    timeout: float = _DEFAULT_IDLE_TIMEOUT,
 ) -> threading.Thread:
     """Monitor heartbeats and trigger shutdown after the idle timeout expires."""
+    poll_interval = min(0.5, max(0.05, timeout / 4))
 
     def _watch() -> None:
         while not shutdown_event.is_set():
-            elapsed = time.monotonic() - handler_cls.last_heartbeat
+            lock = getattr(handler_cls, "state_lock", None)
+            if lock is not None:
+                with lock:
+                    last_heartbeat = handler_cls.last_heartbeat
+            else:
+                last_heartbeat = handler_cls.last_heartbeat
+            elapsed = time.monotonic() - last_heartbeat
             if elapsed > timeout:
                 shutdown_event.set()
                 return
-            shutdown_event.wait(timeout=0.5)
+            shutdown_event.wait(timeout=poll_interval)
 
     t = threading.Thread(target=_watch, daemon=True)
     t.start()

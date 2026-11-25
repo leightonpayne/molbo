@@ -4,5 +4,5 @@ from importlib.metadata import PackageNotFoundError, version
 
 try:
     __version__ = version("molbo")
-except PackageNotFoundError:  # pragma: no cover - only possible from an uninstalled source tree
+except PackageNotFoundError:  # pragma: no cover
     __version__ = "0+unknown"

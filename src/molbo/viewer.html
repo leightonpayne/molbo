@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>{{ title_html }} - Molbo</title>
+    <link rel="icon" type="image/svg+xml" href="{{ favicon_url_html }}" />
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -11,10 +12,12 @@
             --bg: #fcfbf9;
             --surface: #dcd8cf;
             --border: #c8c1b2;
-            --text: #000000;
-            --text-dim: #937657;
-            --accent: #937657;
+            --text: #1c1917;
+            --text-dim: #5c4631;
+            --accent: #6e5237;
             --accent-glow: #fcfbf9;
+            --error: #b91c1c;
+            --live: #15803d;
         }
 
         body {
@@ -45,10 +48,14 @@
             display: flex;
             align-items: center;
             gap: 12px;
+            flex: 1;
             min-width: 0;
         }
 
         .logo {
+            display: inline-flex;
+            align-items: center;
+            flex-shrink: 0;
             font-weight: 700;
             font-size: 16px;
             letter-spacing: 0.5px;
@@ -64,7 +71,7 @@
             border-radius: 4px;
             border: 1px solid var(--border);
             min-width: 0;
-            max-width: min(48vw, 480px);
+            max-width: 480px;
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
@@ -73,22 +80,12 @@
         .topbar-right {
             display: flex;
             align-items: center;
+            flex-shrink: 0;
             gap: 8px;
         }
 
-        .badge {
-            font-size: 11px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            padding: 3px 8px;
-            border-radius: 4px;
-            background: var(--accent-glow);
-            color: var(--accent);
-            border: 1px solid var(--border);
-        }
-
         .icon-button {
+            position: relative;
             display: inline-flex;
             align-items: center;
             justify-content: center;
@@ -107,9 +104,35 @@
             border-color: var(--accent);
         }
 
+        .icon-button:focus-visible,
+        .qr-copy-button:focus-visible,
+        .qr-close-button:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+        }
+
         .icon-button svg {
             width: 16px;
             height: 16px;
+        }
+
+        .icon-button.spinning svg {
+            animation: spin 0.7s linear infinite;
+        }
+
+        .watch-dot {
+            display: none;
+            position: absolute;
+            top: 3px;
+            right: 3px;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--live);
+        }
+
+        .watch-dot.active {
+            display: block;
         }
 
         #app-container {
@@ -167,6 +190,7 @@
             justify-content: center;
             flex-direction: column;
             gap: 12px;
+            padding: 24px;
             background: var(--bg);
             z-index: 6;
         }
@@ -177,11 +201,12 @@
 
         .error-icon {
             font-size: 36px;
+            color: var(--error);
         }
 
         .error-msg {
             font-size: 14px;
-            color: #f87171;
+            color: var(--error);
             max-width: 500px;
             text-align: center;
             line-height: 1.5;
@@ -203,10 +228,48 @@
         }
 
         .qr-card {
-            padding: 14px;
+            width: min(92vw, 340px);
+            padding: 16px;
             border-radius: 14px;
             background: #ffffff;
+            color: var(--text);
             box-shadow: 0 20px 40px rgba(0, 0, 0, 0.18);
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .qr-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .qr-title {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text);
+        }
+
+        .qr-close-button {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 28px;
+            height: 28px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg);
+            color: var(--text-dim);
+            font-size: 18px;
+            line-height: 1;
+            cursor: pointer;
+        }
+
+        .qr-close-button:hover {
+            border-color: var(--accent);
+            color: var(--text);
         }
 
         .qr-box {
@@ -219,8 +282,67 @@
         #qr-code canvas,
         #qr-code img {
             display: block;
-            width: min(72vw, 256px);
+            width: min(72vw, 240px);
             height: auto;
+        }
+
+        .qr-fallback {
+            font-size: 12px;
+            color: var(--text-dim);
+            text-align: center;
+            padding: 16px 8px;
+        }
+
+        .qr-url-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .qr-url {
+            flex: 1;
+            min-width: 0;
+            font-size: 12px;
+            font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+            color: var(--text);
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 6px 8px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .qr-copy-button {
+            flex-shrink: 0;
+            font-size: 12px;
+            font-weight: 600;
+            padding: 6px 10px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg);
+            color: var(--accent);
+            cursor: pointer;
+        }
+
+        .qr-copy-button:hover {
+            border-color: var(--accent);
+        }
+
+        .qr-note {
+            display: none;
+            font-size: 12px;
+            line-height: 1.4;
+            color: var(--text-dim);
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 8px 10px;
+        }
+
+        .qr-note.visible {
+            display: block;
         }
 
         @media (max-width: 768px) {
@@ -238,14 +360,8 @@
             }
 
             .filename {
-                max-width: calc(100vw - 124px);
                 font-size: 12px;
                 padding: 3px 8px;
-            }
-
-            .badge {
-                font-size: 10px;
-                padding: 3px 6px;
             }
 
             .icon-button {
@@ -260,22 +376,43 @@
     <div class="topbar">
         <div class="topbar-left">
             <span class="logo">
-                <svg viewBox="0 0 24 24" aria-hidden="true" style="width:16px;height:16px;vertical-align:-2px;margin-right:4px;">
+                <svg viewBox="0 0 24 24" aria-hidden="true" style="width:16px;height:16px;margin-right:4px;">
                     <circle cx="12" cy="12" r="2.3" fill="currentColor"></circle>
                     <ellipse cx="12" cy="12" rx="9" ry="3.8" fill="none" stroke="currentColor" stroke-width="1.4"></ellipse>
                     <ellipse cx="12" cy="12" rx="9" ry="3.8" fill="none" stroke="currentColor" stroke-width="1.4" transform="rotate(60 12 12)"></ellipse>
                     <ellipse cx="12" cy="12" rx="9" ry="3.8" fill="none" stroke="currentColor" stroke-width="1.4" transform="rotate(120 12 12)"></ellipse>
                 </svg>MOLBO
             </span>
-            <span class="filename">{{ filename_html }}</span>
+            <span class="filename" title="{{ filename_html }}">{{ filename_html }}</span>
         </div>
         <div class="topbar-right">
-            <button class="icon-button" id="qr-button" type="button" aria-label="Show QR code">
+            <button
+                class="icon-button"
+                id="reload-button"
+                type="button"
+                aria-label="Reload structure"
+                title="Reload structure"
+            >
+                <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                    <polyline points="21 3 21 9 15 9" />
+                </svg>
+                <span class="watch-dot" id="watch-dot" aria-hidden="true"></span>
+            </button>
+            <button
+                class="icon-button"
+                id="qr-button"
+                type="button"
+                aria-label="Show share QR code"
+                title="Share session"
+                aria-haspopup="dialog"
+                aria-controls="qr-modal"
+                aria-expanded="false"
+            >
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                     <path fill="currentColor" d="M3 3h8v8H3V3Zm2 2v4h4V5H5Zm8-2h8v8h-8V3Zm2 2v4h4V5h-4ZM3 13h8v8H3v-8Zm2 2v4h4v-4H5Zm8-2h2v2h-2v-2Zm4 0h2v2h-2v-2Zm-2 2h2v2h-2v-2Zm-2 2h2v2h-2v-2Zm4 0h4v4h-2v-2h-2v-2Zm-2 2h2v2h-2v-2Zm-2 2h2v2h-2v-2Z"/>
                 </svg>
             </button>
-            <span class="badge">{{ format_label_html }}</span>
         </div>
     </div>
 
@@ -284,17 +421,27 @@
             <div class="spinner"></div>
             <div class="loading-text">Loading structure…</div>
         </div>
-        <div class="error-box" id="error">
-            <div class="error-icon">⚠</div>
+        <div class="error-box" id="error" role="alert">
+            <div class="error-icon" aria-hidden="true">⚠</div>
             <div class="error-msg" id="error-msg"></div>
         </div>
         <div id="viewer"></div>
     </div>
+
     <div class="qr-modal" id="qr-modal" aria-hidden="true">
-        <div class="qr-card" role="dialog" aria-modal="true" aria-label="QR code">
+        <div class="qr-card" role="dialog" aria-modal="true" aria-labelledby="qr-title">
+            <div class="qr-header">
+                <span class="qr-title" id="qr-title">Share session</span>
+                <button class="qr-close-button" id="qr-close" type="button" aria-label="Close share dialog">&times;</button>
+            </div>
             <div class="qr-box">
                 <div id="qr-code" aria-label="QR code"></div>
             </div>
+            <div class="qr-url-row">
+                <input class="qr-url" id="qr-url" type="text" readonly aria-label="Share URL" />
+                <button class="qr-copy-button" id="qr-copy" type="button">Copy</button>
+            </div>
+            <div class="qr-note" id="qr-note"></div>
         </div>
     </div>
 
@@ -306,20 +453,50 @@
             'cif':   'mmcif',
             'mmcif': 'mmcif',
             'bcif':  'mmcif',
+            'pdbqt': 'pdbqt',
+            'sdf':   'sdf',
+            'mol':   'mol',
+            'mol2':  'mol2',
+            'xyz':   'xyz',
+            'gro':   'gro',
         };
+        var STRUCTURE_NAME = {{ structure_name_json }};
         var FILE_URL = {{ file_url_json }};
         var FORMAT_KEY = {{ format_json }};
         var AUTO_CLOSE = {{ auto_close_json }};
         var SHARE_URL = {{ share_url_json }} || window.location.href;
         var HEARTBEAT_URL = {{ heartbeat_url_json }};
         var BYE_URL = {{ bye_url_json }};
+        var HEARTBEAT_INTERVAL_MS = {{ heartbeat_interval_ms_json }};
+        var WATCH_ENABLED = {{ watch_json }};
+        var VERSION_URL = {{ version_url_json }};
+        var activeViewer = null;
+        var reloadInFlight = false;
+        var pendingReload = false;
+        var pendingForceRefresh = false;
+
+        function createClientId() {
+            if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+                return window.crypto.randomUUID();
+            }
+            return 'client-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+        }
+
+        function withQueryParam(url, key, value) {
+            var separator = url.indexOf('?') === -1 ? '?' : '&';
+            return url + separator + encodeURIComponent(key) + '=' + encodeURIComponent(value);
+        }
+
+        function isLoopbackUrl(rawUrl) {
+            try {
+                var hostname = new URL(rawUrl, window.location.href).hostname.replace(/^\[|\]$/g, '');
+                return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+            } catch (_err) {
+                return false;
+            }
+        }
 
         function applyPublicationLook(viewer) {
-            viewer.plugin.managers.structure.component.setOptions({
-                ...viewer.plugin.managers.structure.component.state.options,
-                visualStyle: 'polymer-cartoon+ligand-ball-and-stick'
-            });
-
             var canvas = viewer.plugin.canvas3d;
             if (!canvas) {
                 return;
@@ -349,40 +526,244 @@
 
         function renderQrCode() {
             var qrTarget = document.getElementById('qr-code');
-            if (!qrTarget || qrTarget.childElementCount > 0 || typeof qrcode !== 'function') {
+            if (!qrTarget || qrTarget.childElementCount > 0) {
                 return;
             }
-            var qr = qrcode(0, 'M');
-            qr.addData(SHARE_URL);
-            qr.make();
-            qrTarget.innerHTML = qr.createImgTag(6, 16, 'Share QR code');
+            if (typeof qrcode !== 'function') {
+                qrTarget.innerHTML = '<p class="qr-fallback">QR generator unavailable.</p>';
+                return;
+            }
+            try {
+                var qr = qrcode(0, 'M');
+                qr.addData(SHARE_URL);
+                qr.make();
+                qrTarget.innerHTML = qr.createImgTag(6, 16, 'Share QR code');
+            } catch (_err) {
+                qrTarget.innerHTML = '<p class="qr-fallback">URL is too long to encode as a QR code.</p>';
+            }
         }
 
         function showQrModal() {
             var modal = document.getElementById('qr-modal');
+            var qrButton = document.getElementById('qr-button');
+            var qrClose = document.getElementById('qr-close');
+            var qrUrl = document.getElementById('qr-url');
+            var qrNote = document.getElementById('qr-note');
             if (!modal) {
                 return;
             }
             renderQrCode();
+            if (qrUrl) {
+                qrUrl.value = SHARE_URL;
+            }
+            if (qrNote) {
+                if (isLoopbackUrl(SHARE_URL)) {
+                    qrNote.textContent = 'This URL is localhost-only. Restart molbo with --host or --base-url to open it on another device.';
+                    qrNote.classList.add('visible');
+                } else {
+                    qrNote.textContent = '';
+                    qrNote.classList.remove('visible');
+                }
+            }
             modal.classList.add('visible');
             modal.setAttribute('aria-hidden', 'false');
+            if (qrButton) {
+                qrButton.setAttribute('aria-expanded', 'true');
+            }
+            if (qrClose) {
+                qrClose.focus();
+            }
         }
 
         function hideQrModal() {
             var modal = document.getElementById('qr-modal');
-            if (!modal) {
+            var qrButton = document.getElementById('qr-button');
+            if (!modal || !modal.classList.contains('visible')) {
                 return;
             }
             modal.classList.remove('visible');
             modal.setAttribute('aria-hidden', 'true');
+            if (qrButton) {
+                qrButton.setAttribute('aria-expanded', 'false');
+                qrButton.focus();
+            }
         }
 
-        function bindQrModal() {
-            var qrButton = document.getElementById('qr-button');
-            var modal = document.getElementById('qr-modal');
+        function copyShareUrl() {
+            var copyButton = document.getElementById('qr-copy');
+            var qrUrl = document.getElementById('qr-url');
+            var markCopied = function () {
+                if (!copyButton) {
+                    return;
+                }
+                copyButton.textContent = 'Copied';
+                setTimeout(function () {
+                    copyButton.textContent = 'Copy';
+                }, 1500);
+            };
+            if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+                navigator.clipboard.writeText(SHARE_URL).then(markCopied).catch(function () {
+                    if (qrUrl) {
+                        qrUrl.select();
+                    }
+                });
+                return;
+            }
+            if (qrUrl) {
+                qrUrl.select();
+                try {
+                    document.execCommand('copy');
+                    markCopied();
+                } catch (_err) {}
+            }
+        }
 
+        function showError(err) {
+            var errorEl = document.getElementById('error');
+            var errorMsg = document.getElementById('error-msg');
+            if (!errorEl || !errorMsg) {
+                return;
+            }
+            var detail = err && err.message ? err.message : String(err);
+            errorMsg.textContent = 'Failed to load structure: ' + detail;
+            errorEl.classList.add('visible');
+        }
+
+        function clearError() {
+            var errorEl = document.getElementById('error');
+            if (errorEl) {
+                errorEl.classList.remove('visible');
+            }
+        }
+
+        async function loadStructureIntoViewer(viewer, versionToken, forceRefresh) {
+            var fmt = FORMAT_MAP[FORMAT_KEY] || 'mmcif';
+            var isBinary = FORMAT_KEY === 'bcif';
+            var url = FILE_URL;
+            if (versionToken) {
+                url = withQueryParam(url, 'v', versionToken);
+            }
+            if (forceRefresh) {
+                url = withQueryParam(url, 'refresh', '1');
+            }
+            await viewer.loadStructureFromUrl(url, fmt, isBinary, { label: STRUCTURE_NAME });
+            applyPublicationLook(viewer);
+        }
+
+        async function reloadStructure(options) {
+            if (!activeViewer) {
+                return;
+            }
+            var forceRefresh = Boolean(options && options.forceRefresh);
+            if (reloadInFlight) {
+                pendingReload = true;
+                pendingForceRefresh = pendingForceRefresh || forceRefresh;
+                return;
+            }
+            reloadInFlight = true;
+            var reloadButton = document.getElementById('reload-button');
+            if (reloadButton) {
+                reloadButton.classList.add('spinning');
+            }
+
+            try {
+                var cameraSnapshot = activeViewer.plugin.canvas3d
+                    ? activeViewer.plugin.canvas3d.camera.getSnapshot()
+                    : null;
+                await activeViewer.plugin.clear(false);
+                await loadStructureIntoViewer(activeViewer, String(Date.now()), forceRefresh);
+                if (cameraSnapshot && activeViewer.plugin.canvas3d) {
+                    activeViewer.plugin.canvas3d.camera.setState(cameraSnapshot, 0);
+                }
+                clearError();
+            } catch (err) {
+                showError(err);
+                console.error(err);
+            } finally {
+                reloadInFlight = false;
+                if (reloadButton) {
+                    reloadButton.classList.remove('spinning');
+                }
+                if (pendingReload) {
+                    var nextForce = pendingForceRefresh;
+                    pendingReload = false;
+                    pendingForceRefresh = false;
+                    reloadStructure({ forceRefresh: nextForce });
+                }
+            }
+        }
+
+        function startFileWatcher() {
+            var watchDot = document.getElementById('watch-dot');
+            var reloadButton = document.getElementById('reload-button');
+            if (watchDot) {
+                watchDot.classList.add('active');
+            }
+            if (reloadButton) {
+                reloadButton.setAttribute('title', 'Reload structure (watching for changes)');
+            }
+
+            var lastVersion = null;
+            var debounceTimer = null;
+
+            var checkVersion = function () {
+                if (document.visibilityState === 'hidden') {
+                    return;
+                }
+                fetch(VERSION_URL, { cache: 'no-store' })
+                    .then(function (resp) {
+                        return resp.ok ? resp.json() : null;
+                    })
+                    .then(function (data) {
+                        if (!data || !data.version) {
+                            return;
+                        }
+                        if (lastVersion === null) {
+                            lastVersion = data.version;
+                            return;
+                        }
+                        if (data.version !== lastVersion) {
+                            lastVersion = data.version;
+                            if (debounceTimer) {
+                                clearTimeout(debounceTimer);
+                            }
+                            debounceTimer = setTimeout(function () {
+                                reloadStructure({ forceRefresh: false });
+                            }, 150);
+                        }
+                    })
+                    .catch(function () {});
+            };
+
+            checkVersion();
+            setInterval(checkVersion, 1000);
+            document.addEventListener('visibilitychange', function () {
+                if (document.visibilityState === 'visible') {
+                    checkVersion();
+                }
+            });
+        }
+
+        function bindControls() {
+            var qrButton = document.getElementById('qr-button');
+            var qrClose = document.getElementById('qr-close');
+            var qrCopy = document.getElementById('qr-copy');
+            var modal = document.getElementById('qr-modal');
+            var reloadButton = document.getElementById('reload-button');
+
+            if (reloadButton) {
+                reloadButton.addEventListener('click', function () {
+                    reloadStructure({ forceRefresh: true });
+                });
+            }
             if (qrButton) {
                 qrButton.addEventListener('click', showQrModal);
+            }
+            if (qrClose) {
+                qrClose.addEventListener('click', hideQrModal);
+            }
+            if (qrCopy) {
+                qrCopy.addEventListener('click', copyShareUrl);
             }
             if (modal) {
                 modal.addEventListener('click', function (event) {
@@ -400,8 +781,6 @@
 
         async function init() {
             var loadingEl = document.getElementById('loading');
-            var errorEl   = document.getElementById('error');
-            var errorMsg  = document.getElementById('error-msg');
 
             try {
                 var viewer = await molstar.Viewer.create('viewer', {
@@ -416,35 +795,58 @@
                     collapseLeftPanel: true,
                 });
 
-                var fmt      = FORMAT_MAP[FORMAT_KEY] || 'mmcif';
-                var isBinary = FORMAT_KEY === 'bcif';
-
-                await viewer.loadStructureFromUrl(FILE_URL, fmt, isBinary);
-                applyPublicationLook(viewer);
-
+                activeViewer = viewer;
+                await loadStructureIntoViewer(viewer, null, false);
                 loadingEl.classList.add('hidden');
+                if (WATCH_ENABLED) {
+                    startFileWatcher();
+                }
             } catch (err) {
                 loadingEl.classList.add('hidden');
-                errorMsg.textContent = 'Failed to load structure: ' + err.message;
-                errorEl.classList.add('visible');
+                showError(err);
                 console.error(err);
             }
         }
 
-        bindQrModal();
+        bindControls();
         init();
 
         if (AUTO_CLOSE) {
-            window.addEventListener('beforeunload', function () {
-                navigator.sendBeacon(BYE_URL);
-            });
-            window.addEventListener('pagehide', function () {
-                navigator.sendBeacon(BYE_URL);
-            });
+            var CLIENT_ID = createClientId();
+            var CLIENT_HEARTBEAT_URL = withQueryParam(HEARTBEAT_URL, 'client', CLIENT_ID);
+            var CLIENT_BYE_URL = withQueryParam(BYE_URL, 'client', CLIENT_ID);
+            var byeSent = false;
 
-            setInterval(function () {
-                fetch(HEARTBEAT_URL, { cache: 'no-store' }).catch(function () {});
-            }, 5000);
+            var sendHeartbeat = function () {
+                fetch(CLIENT_HEARTBEAT_URL, { cache: 'no-store' }).catch(function () {});
+            };
+
+            var sendBye = function () {
+                if (byeSent) {
+                    return;
+                }
+                byeSent = true;
+                if (navigator.sendBeacon) {
+                    navigator.sendBeacon(CLIENT_BYE_URL);
+                } else {
+                    fetch(CLIENT_BYE_URL, { method: 'POST', keepalive: true }).catch(function () {});
+                }
+            };
+
+            sendHeartbeat();
+            setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS);
+
+            document.addEventListener('visibilitychange', function () {
+                if (document.visibilityState === 'visible') {
+                    byeSent = false;
+                    sendHeartbeat();
+                }
+            });
+            window.addEventListener('pageshow', function () {
+                byeSent = false;
+                sendHeartbeat();
+            });
+            window.addEventListener('pagehide', sendBye);
         }
     </script>
 </body>
