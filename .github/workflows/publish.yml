@@ -6,6 +6,9 @@ on:
       - published
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -31,6 +34,9 @@ jobs:
       - name: Check formatting
         run: uv run ruff format --check .
 
+      - name: Type check
+        run: uv run ty check
+
       - name: Run tests
         run: uv run python -m unittest discover -s tests -v
 
@@ -49,7 +55,7 @@ jobs:
       - name: Smoke-test installed wheel
         run: |
           /tmp/molbo-wheel-smoke/bin/molbo --version
-          /tmp/molbo-wheel-smoke/bin/python -c "from importlib.resources import files; assert files('molbo').joinpath('viewer.html').is_file()"
+          /tmp/molbo-wheel-smoke/bin/python -c "from importlib.resources import files; pkg = files('molbo'); required = ['viewer.html', 'vendor/molstar-4.5.0.css', 'vendor/molstar-4.5.0.js', 'vendor/qrcode-generator-2.0.4.min.js', 'vendor/LICENSE-molstar', 'vendor/LICENSE-qrcode-generator']; missing = [p for p in required if not pkg.joinpath(p).is_file()]; assert not missing, f'missing packaged files: {missing}'"
           /tmp/molbo-wheel-smoke/bin/python -c "from importlib.metadata import requires; assert not any('zensical' in dependency for dependency in requires('molbo') or [])"
 
       - name: Upload distributions

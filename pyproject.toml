@@ -9,7 +9,7 @@ description = "Inspect PDB/CIF molecular structures from the command line"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "src/molbo/vendor/LICENSE-*"]
 authors = [{ name = "molbo contributors" }]
 keywords = ["molecular", "structure", "pdb", "cif", "molstar", "viewer", "cli", "molbo"]
 classifiers = [
@@ -57,12 +57,13 @@ line-length = 100
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "I"]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP", "A", "ARG", "N", "SIM"]
 
 [dependency-groups]
 dev = [
     "flexoki-zensical>=0.1.0",
     "pymdown-extensions>=10.21.2",
     "ruff>=0.9.0",
+    "ty>=0.0.107",
     "zensical>=0.0.43",
 ]
