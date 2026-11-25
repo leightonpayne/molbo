@@ -95,6 +95,7 @@
             border-radius: 6px;
             background: var(--bg);
             color: var(--accent);
+            text-decoration: none;
             cursor: pointer;
             transition: background 0.15s ease, border-color 0.15s ease;
         }
@@ -330,6 +331,21 @@
             border-color: var(--accent);
         }
 
+        .qr-toggle {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            color: var(--text-dim);
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .qr-toggle input {
+            accent-color: var(--accent);
+            cursor: pointer;
+        }
+
         .qr-note {
             display: none;
             font-size: 12px;
@@ -399,6 +415,20 @@
                 </svg>
                 <span class="watch-dot" id="watch-dot" aria-hidden="true"></span>
             </button>
+            <a
+                class="icon-button"
+                id="download-button"
+                href="{{ file_url_html }}"
+                download="{{ download_filename_html }}"
+                aria-label="Download structure"
+                title="Download structure"
+            >
+                <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                    <polyline points="7 10 12 15 17 10" />
+                    <line x1="12" y1="15" x2="12" y2="3" />
+                </svg>
+            </a>
             <button
                 class="icon-button"
                 id="qr-button"
@@ -441,6 +471,10 @@
                 <input class="qr-url" id="qr-url" type="text" readonly aria-label="Share URL" />
                 <button class="qr-copy-button" id="qr-copy" type="button">Copy</button>
             </div>
+            <label class="qr-toggle">
+                <input type="checkbox" id="qr-include-view" />
+                <span>Include current camera view</span>
+            </label>
             <div class="qr-note" id="qr-note"></div>
         </div>
     </div>
@@ -464,7 +498,8 @@
         var FILE_URL = {{ file_url_json }};
         var FORMAT_KEY = {{ format_json }};
         var AUTO_CLOSE = {{ auto_close_json }};
-        var SHARE_URL = {{ share_url_json }} || window.location.href;
+        var EXPLICIT_SHARE_URL = {{ share_url_json }};
+        var FALLBACK_SHARE_URL = {{ fallback_share_url_json }};
         var HEARTBEAT_URL = {{ heartbeat_url_json }};
         var BYE_URL = {{ bye_url_json }};
         var HEARTBEAT_INTERVAL_MS = {{ heartbeat_interval_ms_json }};
@@ -474,6 +509,13 @@
         var reloadInFlight = false;
         var pendingReload = false;
         var pendingForceRefresh = false;
+        var readyResolve = null;
+        var readyReject = null;
+        var readyPromise = new Promise(function (resolve, reject) {
+            readyResolve = resolve;
+            readyReject = reject;
+        });
+        readyPromise.catch(function () {});
 
         function createClientId() {
             if (window.crypto && typeof window.crypto.randomUUID === 'function') {
@@ -494,6 +536,93 @@
             } catch (_err) {
                 return false;
             }
+        }
+
+        function roundNum(value, decimals) {
+            var factor = Math.pow(10, decimals);
+            return Math.round(value * factor) / factor;
+        }
+
+        function encodeCameraHash(snapshot) {
+            if (!snapshot || !snapshot.position || !snapshot.target || !snapshot.up) {
+                return '';
+            }
+            var mode = snapshot.mode === 'orthographic' ? 'o' : 'p';
+            var parts = [
+                mode,
+                roundNum(snapshot.position[0], 3),
+                roundNum(snapshot.position[1], 3),
+                roundNum(snapshot.position[2], 3),
+                roundNum(snapshot.target[0], 3),
+                roundNum(snapshot.target[1], 3),
+                roundNum(snapshot.target[2], 3),
+                roundNum(snapshot.up[0], 4),
+                roundNum(snapshot.up[1], 4),
+                roundNum(snapshot.up[2], 4),
+                roundNum(snapshot.fov, 4),
+                roundNum(snapshot.radius, 3),
+            ];
+            return '#cam=' + parts.join(',');
+        }
+
+        function decodeCameraHash(hash) {
+            if (!hash || hash.indexOf('#cam=') !== 0) {
+                return null;
+            }
+            var parts = hash.slice(5).split(',');
+            if (parts.length !== 12) {
+                return null;
+            }
+            var mode = parts[0] === 'o' ? 'orthographic' : (parts[0] === 'p' ? 'perspective' : null);
+            if (!mode) {
+                return null;
+            }
+            var nums = [];
+            for (var i = 1; i < parts.length; i++) {
+                var value = Number(parts[i]);
+                if (!Number.isFinite(value)) {
+                    return null;
+                }
+                nums.push(value);
+            }
+            return {
+                mode: mode,
+                position: [nums[0], nums[1], nums[2]],
+                target: [nums[3], nums[4], nums[5]],
+                up: [nums[6], nums[7], nums[8]],
+                fov: nums[9],
+                radius: nums[10],
+            };
+        }
+
+        function applyCameraFromHash(viewer) {
+            var snapshot = decodeCameraHash(window.location.hash);
+            if (snapshot && viewer && viewer.plugin.canvas3d) {
+                viewer.plugin.canvas3d.camera.setState(snapshot, 0);
+            }
+        }
+
+        function currentBaseShareUrl() {
+            if (EXPLICIT_SHARE_URL) {
+                return EXPLICIT_SHARE_URL;
+            }
+            var pageHref = window.location.href.split('#')[0];
+            if (isLoopbackUrl(pageHref) && FALLBACK_SHARE_URL) {
+                return FALLBACK_SHARE_URL;
+            }
+            return pageHref;
+        }
+
+        function currentShareUrl() {
+            var base = currentBaseShareUrl();
+            var includeView = document.getElementById('qr-include-view');
+            if (includeView && includeView.checked && activeViewer && activeViewer.plugin.canvas3d) {
+                var hash = encodeCameraHash(activeViewer.plugin.canvas3d.camera.getSnapshot());
+                if (hash) {
+                    return base.split('#')[0] + hash;
+                }
+            }
+            return base;
         }
 
         function applyPublicationLook(viewer) {
@@ -524,9 +653,9 @@
             });
         }
 
-        function renderQrCode() {
+        function renderQrCode(shareUrl) {
             var qrTarget = document.getElementById('qr-code');
-            if (!qrTarget || qrTarget.childElementCount > 0) {
+            if (!qrTarget) {
                 return;
             }
             if (typeof qrcode !== 'function') {
@@ -535,7 +664,7 @@
             }
             try {
                 var qr = qrcode(0, 'M');
-                qr.addData(SHARE_URL);
+                qr.addData(shareUrl);
                 qr.make();
                 qrTarget.innerHTML = qr.createImgTag(6, 16, 'Share QR code');
             } catch (_err) {
@@ -543,21 +672,16 @@
             }
         }
 
-        function showQrModal() {
-            var modal = document.getElementById('qr-modal');
-            var qrButton = document.getElementById('qr-button');
-            var qrClose = document.getElementById('qr-close');
+        function updateQrModalContent() {
+            var shareUrl = currentShareUrl();
             var qrUrl = document.getElementById('qr-url');
             var qrNote = document.getElementById('qr-note');
-            if (!modal) {
-                return;
-            }
-            renderQrCode();
+            renderQrCode(shareUrl);
             if (qrUrl) {
-                qrUrl.value = SHARE_URL;
+                qrUrl.value = shareUrl;
             }
             if (qrNote) {
-                if (isLoopbackUrl(SHARE_URL)) {
+                if (isLoopbackUrl(shareUrl)) {
                     qrNote.textContent = 'This URL is localhost-only. Restart molbo with --host or --base-url to open it on another device.';
                     qrNote.classList.add('visible');
                 } else {
@@ -565,6 +689,16 @@
                     qrNote.classList.remove('visible');
                 }
             }
+        }
+
+        function showQrModal() {
+            var modal = document.getElementById('qr-modal');
+            var qrButton = document.getElementById('qr-button');
+            var qrClose = document.getElementById('qr-close');
+            if (!modal) {
+                return;
+            }
+            updateQrModalContent();
             modal.classList.add('visible');
             modal.setAttribute('aria-hidden', 'false');
             if (qrButton) {
@@ -590,6 +724,7 @@
         }
 
         function copyShareUrl() {
+            var shareUrl = currentShareUrl();
             var copyButton = document.getElementById('qr-copy');
             var qrUrl = document.getElementById('qr-url');
             var markCopied = function () {
@@ -602,7 +737,7 @@
                 }, 1500);
             };
             if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-                navigator.clipboard.writeText(SHARE_URL).then(markCopied).catch(function () {
+                navigator.clipboard.writeText(shareUrl).then(markCopied).catch(function () {
                     if (qrUrl) {
                         qrUrl.select();
                     }
@@ -748,6 +883,7 @@
             var qrButton = document.getElementById('qr-button');
             var qrClose = document.getElementById('qr-close');
             var qrCopy = document.getElementById('qr-copy');
+            var qrIncludeView = document.getElementById('qr-include-view');
             var modal = document.getElementById('qr-modal');
             var reloadButton = document.getElementById('reload-button');
 
@@ -765,6 +901,9 @@
             if (qrCopy) {
                 qrCopy.addEventListener('click', copyShareUrl);
             }
+            if (qrIncludeView) {
+                qrIncludeView.addEventListener('change', updateQrModalContent);
+            }
             if (modal) {
                 modal.addEventListener('click', function (event) {
                     if (event.target === modal) {
@@ -776,6 +915,9 @@
                 if (event.key === 'Escape') {
                     hideQrModal();
                 }
+            });
+            window.addEventListener('hashchange', function () {
+                applyCameraFromHash(activeViewer);
             });
         }
 
@@ -796,17 +938,59 @@
                 });
 
                 activeViewer = viewer;
+                window.molbo.viewer = viewer;
                 await loadStructureIntoViewer(viewer, null, false);
+                applyCameraFromHash(viewer);
                 loadingEl.classList.add('hidden');
                 if (WATCH_ENABLED) {
                     startFileWatcher();
+                }
+                if (readyResolve) {
+                    readyResolve(window.molbo);
                 }
             } catch (err) {
                 loadingEl.classList.add('hidden');
                 showError(err);
                 console.error(err);
+                if (readyReject) {
+                    readyReject(err);
+                }
             }
         }
+
+        window.molbo = {
+            ready: readyPromise,
+            viewer: null,
+            name: STRUCTURE_NAME,
+            format: FORMAT_KEY,
+            reload: function (options) {
+                return reloadStructure(options);
+            },
+            getCameraHash: function () {
+                if (!activeViewer || !activeViewer.plugin.canvas3d) {
+                    return '';
+                }
+                return encodeCameraHash(activeViewer.plugin.canvas3d.camera.getSnapshot());
+            },
+            setCameraHash: function (hash) {
+                var snapshot = decodeCameraHash(hash);
+                if (!snapshot || !activeViewer || !activeViewer.plugin.canvas3d) {
+                    return false;
+                }
+                activeViewer.plugin.canvas3d.camera.setState(snapshot, 0);
+                return true;
+            },
+            getShareUrl: function (includeView) {
+                var base = currentBaseShareUrl();
+                if (includeView) {
+                    var hash = window.molbo.getCameraHash();
+                    if (hash) {
+                        return base.split('#')[0] + hash;
+                    }
+                }
+                return base;
+            },
+        };
 
         bindControls();
         init();

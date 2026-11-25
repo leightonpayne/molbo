@@ -19,15 +19,20 @@ from email.message import Message
 from functools import cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _dist_version
 from importlib.resources import files
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from typing import Any
+from typing import Any, Literal, get_args
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 
-from molbo import __version__
+try:
+    _PACKAGE_VERSION = _dist_version("molbo")
+except PackageNotFoundError:  # pragma: no cover
+    _PACKAGE_VERSION = "0+unknown"
 
 _VIEWER_TEMPLATE = files("molbo").joinpath("viewer.html").read_text(encoding="utf-8")
 _TEMPLATE_PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-z0-9_]+)\s*\}\}")
@@ -49,6 +54,48 @@ _FAVICON_SVG = (
     b'transform="rotate(120 12 12)"/>'
     b"</svg>"
 )
+
+_BASE_SUFFIXES: dict[str, str] = {
+    ".pdb": "pdb",
+    ".ent": "pdb",
+    ".cif": "cif",
+    ".mmcif": "mmcif",
+    ".bcif": "bcif",
+    ".pdbqt": "pdbqt",
+    ".sdf": "sdf",
+    ".sd": "sdf",
+    ".mol": "mol",
+    ".mol2": "mol2",
+    ".xyz": "xyz",
+    ".gro": "gro",
+}
+SUPPORTED_SUFFIXES: dict[tuple[str, ...], str] = {
+    **{(ext,): fmt for ext, fmt in _BASE_SUFFIXES.items()},
+    **{(ext, ".gz"): fmt for ext, fmt in _BASE_SUFFIXES.items()},
+}
+SUPPORTED_EXTENSIONS = ", ".join("".join(suffixes) for suffixes in SUPPORTED_SUFFIXES)
+FormatChoice = Literal["pdb", "cif", "mmcif", "bcif", "pdbqt", "sdf", "mol", "mol2", "xyz", "gro"]
+SUPPORTED_FORMAT_KEYS: tuple[str, ...] = get_args(FormatChoice)
+
+_PDB_ID_RE = re.compile(r"^[0-9][A-Za-z0-9]{3}$")
+_EXTENDED_PDB_ID_RE = re.compile(r"^pdb_[A-Za-z0-9]{8}$", re.IGNORECASE)
+_ALPHAFOLD_PREFIX_RE = re.compile(r"^(?:af|alphafold):([A-Za-z0-9_-]+)$", re.IGNORECASE)
+_ALPHAFOLD_ENTRY_RE = re.compile(r"^AF-([A-Za-z0-9]+)-F(\d+)(?:-model_v(\d+))?$", re.IGNORECASE)
+
+_RCSB_DOWNLOAD_URLS: dict[str, tuple[str, str, str]] = {
+    "cif": ("https://files.rcsb.org/download/{pdb_id}.cif", "cif", "{pdb_id}.cif"),
+    "mmcif": ("https://files.rcsb.org/download/{pdb_id}.cif", "cif", "{pdb_id}.cif"),
+    "pdb": ("https://files.rcsb.org/download/{pdb_id}.pdb", "pdb", "{pdb_id}.pdb"),
+    "bcif": ("https://models.rcsb.org/{pdb_id}.bcif", "bcif", "{pdb_id}.bcif"),
+}
+_ALPHAFOLD_FORMATS: dict[str, str] = {
+    "cif": "cif",
+    "mmcif": "cif",
+    "pdb": "pdb",
+    "bcif": "bcif",
+}
+_ALPHAFOLD_API_URL = "https://alphafold.ebi.ac.uk/api/prediction/{uniprot}"
+_ALPHAFOLD_FILE_URL = "https://alphafold.ebi.ac.uk/files/{model_id}.{ext}"
 
 _ALPHAFOLD_FORMAT_FIELDS: dict[str, str] = {
     "cif": "cifUrl",
@@ -110,6 +157,7 @@ class StructureSource:
     format_key: str
     local_path: Path | None = None
     remote_url: str | None = None
+    inline_bytes: bytes | None = None
     fetch_timeout: float = 30.0
     pdb_id: str | None = None
     alphafold_id: str | None = None
@@ -118,6 +166,189 @@ class StructureSource:
     @property
     def is_remote(self) -> bool:
         return self.remote_url is not None or self.alphafold_api_url is not None
+
+    @property
+    def is_inline(self) -> bool:
+        return self.inline_bytes is not None
+
+    @property
+    def source_kind(self) -> str:
+        if self.inline_bytes is not None:
+            return "stdin"
+        if self.pdb_id is not None:
+            return "pdb"
+        if self.alphafold_id is not None:
+            return "alphafold"
+        if self.is_remote:
+            return "remote"
+        return "local"
+
+
+def resolve_structure_format(file: Path) -> str | None:
+    suffixes = tuple(suffix.lower() for suffix in file.suffixes)
+    for width in (2, 1):
+        key = suffixes[-width:]
+        if key in SUPPORTED_SUFFIXES:
+            return SUPPORTED_SUFFIXES[key]
+    return None
+
+
+def looks_like_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def looks_like_pdb_id(value: str) -> bool:
+    return (
+        _PDB_ID_RE.fullmatch(value) is not None or _EXTENDED_PDB_ID_RE.fullmatch(value) is not None
+    )
+
+
+def looks_like_alphafold_id(value: str) -> bool:
+    return (
+        _ALPHAFOLD_PREFIX_RE.fullmatch(value) is not None
+        or _ALPHAFOLD_ENTRY_RE.fullmatch(value) is not None
+    )
+
+
+def pdb_id_to_structure_source(
+    value: str,
+    fetch_timeout: float = 30.0,
+    format_override: str | None = None,
+) -> StructureSource:
+    requested_format = (format_override or "cif").lower()
+    if requested_format not in _RCSB_DOWNLOAD_URLS:
+        raise ValueError("Unsupported --format for PDB IDs. Choose from cif, mmcif, pdb, or bcif.")
+
+    is_extended = _EXTENDED_PDB_ID_RE.fullmatch(value) is not None
+    if is_extended:
+        pdb_id = value.lower()
+        if requested_format == "pdb":
+            if pdb_id.startswith("pdb_0000"):
+                short_id = pdb_id[8:].upper()
+                return StructureSource(
+                    display_name=f"{short_id}.pdb",
+                    format_key="pdb",
+                    remote_url=_RCSB_DOWNLOAD_URLS["pdb"][0].format(pdb_id=short_id),
+                    fetch_timeout=fetch_timeout,
+                    pdb_id=pdb_id,
+                )
+            raise ValueError(
+                "Extended PDB IDs only support cif, mmcif, or bcif downloads from RCSB."
+            )
+    else:
+        pdb_id = value.upper()
+
+    url_template, format_key, name_template = _RCSB_DOWNLOAD_URLS[requested_format]
+    return StructureSource(
+        display_name=name_template.format(pdb_id=pdb_id),
+        format_key=format_key,
+        remote_url=url_template.format(pdb_id=pdb_id),
+        fetch_timeout=fetch_timeout,
+        pdb_id=pdb_id,
+    )
+
+
+def alphafold_id_to_structure_source(
+    value: str,
+    fetch_timeout: float = 30.0,
+    format_override: str | None = None,
+) -> StructureSource:
+    requested_format = (format_override or "cif").lower()
+    if requested_format not in _ALPHAFOLD_FORMATS:
+        raise ValueError(
+            "Unsupported --format for AlphaFold DB IDs. Choose from cif, mmcif, pdb, or bcif."
+        )
+    format_key = _ALPHAFOLD_FORMATS[requested_format]
+
+    prefix_match = _ALPHAFOLD_PREFIX_RE.fullmatch(value)
+    if prefix_match is not None:
+        inner = prefix_match.group(1)
+        entry_match = _ALPHAFOLD_ENTRY_RE.fullmatch(inner)
+        if entry_match is None:
+            uniprot = inner.upper()
+            return StructureSource(
+                display_name=f"AF-{uniprot}.{format_key}",
+                format_key=format_key,
+                fetch_timeout=fetch_timeout,
+                alphafold_id=uniprot,
+                alphafold_api_url=_ALPHAFOLD_API_URL.format(uniprot=uniprot),
+            )
+    else:
+        entry_match = _ALPHAFOLD_ENTRY_RE.fullmatch(value)
+
+    assert entry_match is not None
+    uniprot = entry_match.group(1).upper()
+    fragment = entry_match.group(2)
+    version = entry_match.group(3)
+    entry_id = f"AF-{uniprot}-F{fragment}"
+    if version is not None:
+        model_id = f"{entry_id}-model_v{version}"
+        return StructureSource(
+            display_name=f"{model_id}.{format_key}",
+            format_key=format_key,
+            remote_url=_ALPHAFOLD_FILE_URL.format(model_id=model_id, ext=format_key),
+            fetch_timeout=fetch_timeout,
+            alphafold_id=model_id,
+        )
+    return StructureSource(
+        display_name=f"{entry_id}.{format_key}",
+        format_key=format_key,
+        fetch_timeout=fetch_timeout,
+        alphafold_id=entry_id,
+        alphafold_api_url=_ALPHAFOLD_API_URL.format(uniprot=uniprot),
+    )
+
+
+def resolve_source(
+    value: str | Path,
+    *,
+    fetch_timeout: float = 30.0,
+    format_override: str | None = None,
+) -> StructureSource | None:
+    """Resolve a path, URL, PDB ID, or AlphaFold DB ID into a StructureSource.
+
+    Returns ``None`` when a local file or URL lacks a recognized structure suffix and
+    *format_override* is not given. Raises ``IsADirectoryError``, ``FileNotFoundError``,
+    ``OSError``, or ``ValueError`` for invalid inputs.
+    """
+    raw = str(value)
+    fmt_override = format_override.lower() if format_override is not None else None
+    if fmt_override is not None and fmt_override not in SUPPORTED_FORMAT_KEYS:
+        raise ValueError(
+            f"Unsupported format {format_override!r}. Choose from {', '.join(SUPPORTED_FORMAT_KEYS)}."
+        )
+
+    if looks_like_url(raw):
+        display_name = display_name_from_url(raw)
+        fmt = fmt_override or resolve_structure_format(Path(display_name))
+        if fmt is None:
+            return None
+        return StructureSource(
+            display_name=display_name,
+            format_key=fmt,
+            remote_url=raw,
+            fetch_timeout=fetch_timeout,
+        )
+
+    path = Path(raw).expanduser().resolve()
+    if path.exists():
+        if path.is_dir():
+            raise IsADirectoryError(raw)
+        if not path.is_file():
+            raise OSError(f"Path is not a regular file: {raw}")
+        fmt = fmt_override or resolve_structure_format(path)
+        if fmt is None:
+            return None
+        return StructureSource(display_name=path.name, format_key=fmt, local_path=path)
+
+    if looks_like_pdb_id(raw):
+        return pdb_id_to_structure_source(raw, fetch_timeout, format_override=fmt_override)
+
+    if looks_like_alphafold_id(raw):
+        return alphafold_id_to_structure_source(raw, fetch_timeout, format_override=fmt_override)
+
+    raise FileNotFoundError(raw)
 
 
 @cache
@@ -162,6 +393,10 @@ def _guess_mime(name: str, format_key: str | None = None) -> str:
 
 def _guess_content_encoding(name: str) -> str | None:
     return "gzip" if name.lower().endswith(".gz") else None
+
+
+def _is_gzip_bytes(data: bytes) -> bool:
+    return data.startswith(b"\x1f\x8b")
 
 
 def local_file_signature(path: Path) -> str | None:
@@ -213,6 +448,34 @@ def local_access_host(host: str) -> str:
     return stripped
 
 
+def detect_lan_host(host: str) -> str | None:
+    """Detect a non-loopback LAN address when binding a wildcard host."""
+    stripped = host.strip("[]")
+    if stripped in {"", "0.0.0.0"}:
+        family = socket.AF_INET
+        probe_target = ("192.0.2.1", 80)
+    elif stripped == "::":
+        family = socket.AF_INET6
+        probe_target = ("2001:db8::1", 80)
+    else:
+        return None
+
+    try:
+        with socket.socket(family, socket.SOCK_DGRAM) as sock:
+            sock.connect(probe_target)
+            detected = sock.getsockname()[0]
+    except OSError:
+        return None
+
+    try:
+        parsed = ipaddress.ip_address(detected.split("%", 1)[0])
+    except ValueError:
+        return None
+    if parsed.is_loopback or parsed.is_unspecified:
+        return None
+    return str(parsed)
+
+
 def _resolve_address_family(host: str) -> socket.AddressFamily:
     stripped = host.strip("[]")
     if not stripped:
@@ -245,23 +508,31 @@ def compute_heartbeat_interval_ms(idle_timeout: float) -> int:
 def render_viewer_html(
     structure_name: str,
     format_key: str,
-    file_url: str,
-    auto_close: bool,
+    file_url: str = "./structure",
+    auto_close: bool = False,
     share_url: str | None = None,
-    molstar_css_url: str = "/assets/molstar-4.5.0.css",
-    molstar_js_url: str = "/assets/molstar-4.5.0.js",
-    qrcode_js_url: str = "/assets/qrcode-generator-2.0.4.min.js",
-    heartbeat_url: str = "/heartbeat",
-    bye_url: str = "/bye",
+    molstar_css_url: str = "./assets/molstar-4.5.0.css",
+    molstar_js_url: str = "./assets/molstar-4.5.0.js",
+    qrcode_js_url: str = "./assets/qrcode-generator-2.0.4.min.js",
+    heartbeat_url: str = "./heartbeat",
+    bye_url: str = "./bye",
     heartbeat_interval_ms: int = 5000,
     watch: bool = False,
-    version_url: str = "/version",
-    favicon_url: str = "/favicon.ico",
+    version_url: str = "./version",
+    favicon_url: str = "./favicon.ico",
+    fallback_share_url: str | None = None,
 ) -> str:
     """Render the viewer template with escaped HTML and script-safe JSON values."""
+    download_name = (
+        structure_name[:-3]
+        if structure_name.lower().endswith(".gz") and len(structure_name) > 3
+        else structure_name
+    )
     replacements = {
         "title_html": html.escape(structure_name, quote=True),
         "filename_html": html.escape(structure_name, quote=True),
+        "download_filename_html": html.escape(download_name, quote=True),
+        "file_url_html": html.escape(file_url, quote=True),
         "favicon_url_html": html.escape(favicon_url, quote=True),
         "molstar_css_url_html": html.escape(molstar_css_url, quote=True),
         "molstar_js_url_html": html.escape(molstar_js_url, quote=True),
@@ -271,6 +542,7 @@ def render_viewer_html(
         "file_url_json": _json_for_script(file_url),
         "auto_close_json": _json_for_script(auto_close),
         "share_url_json": _json_for_script(share_url),
+        "fallback_share_url_json": _json_for_script(fallback_share_url),
         "heartbeat_url_json": _json_for_script(heartbeat_url),
         "bye_url_json": _json_for_script(bye_url),
         "heartbeat_interval_ms_json": _json_for_script(heartbeat_interval_ms),
@@ -319,8 +591,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     structure_source: StructureSource
     viewer_html_bytes: bytes = b""
+    fallback_share_url: str | None = None
     shutdown_event: threading.Event | None = None
     auto_close: bool = False
+    watch: bool = False
     base_path: str = ""
     idle_timeout: float = _DEFAULT_IDLE_TIMEOUT
     bye_grace: float = _DEFAULT_BYE_GRACE
@@ -364,6 +638,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._serve_structure(send_body=send_body, force_refresh=refresh)
         elif inner_path == "/version":
             self._serve_version(send_body=send_body)
+        elif inner_path in {"/info", "/health"}:
+            self._serve_info(send_body=send_body)
         elif inner_path == "/favicon.ico":
             self._serve_favicon(send_body=send_body)
         elif inner_path in _VENDORED_ASSETS:
@@ -437,11 +713,42 @@ class _Handler(BaseHTTPRequestHandler):
             cors=True,
         )
 
+    def _serve_info(self, *, send_body: bool = True) -> None:
+        payload = {
+            "status": "ok",
+            "version": _PACKAGE_VERSION,
+            "name": self.structure_source.display_name,
+            "format": self.structure_source.format_key,
+            "source_kind": self.structure_source.source_kind,
+            "watch": self.watch,
+            "auto_close": self.auto_close,
+        }
+        body = json.dumps(payload).encode("utf-8")
+        self._send_bytes(
+            body,
+            "application/json; charset=utf-8",
+            send_body=send_body,
+            cors=True,
+        )
+
     def _serve_structure(self, *, send_body: bool = True, force_refresh: bool = False) -> None:
+        if self.structure_source.is_inline:
+            self._serve_inline_structure(send_body=send_body)
+            return
         if self.structure_source.is_remote:
             self._serve_remote_structure(send_body=send_body, force_refresh=force_refresh)
             return
         self._serve_local_structure(send_body=send_body)
+
+    def _serve_inline_structure(self, *, send_body: bool = True) -> None:
+        assert self.structure_source.inline_bytes is not None
+        data = self.structure_source.inline_bytes
+        mime = _guess_mime(
+            self.structure_source.display_name,
+            format_key=self.structure_source.format_key,
+        )
+        headers = {"Content-Encoding": "gzip"} if _is_gzip_bytes(data) else None
+        self._send_bytes(data, mime, send_body=send_body, headers=headers, cors=True)
 
     def _serve_asset(self, path: str, *, send_body: bool = True) -> None:
         asset = _VENDORED_ASSETS[path]
@@ -649,7 +956,7 @@ class _Handler(BaseHTTPRequestHandler):
             request = Request(
                 url,
                 headers={
-                    "User-Agent": f"molbo/{__version__}",
+                    "User-Agent": f"molbo/{_PACKAGE_VERSION}",
                     "Accept": accept,
                 },
             )
@@ -734,6 +1041,7 @@ class _Handler(BaseHTTPRequestHandler):
     def _cors_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Robots-Tag", "noindex, nofollow")
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -762,31 +1070,15 @@ def make_server(
 ) -> HTTPServer:
     """Create (but don't start) an HTTPServer for *structure_source*."""
     normalized_base_path = normalize_base_path(base_path)
-    viewer_html_bytes = render_viewer_html(
-        structure_name=structure_source.display_name,
-        format_key=structure_source.format_key,
-        file_url=route_path(normalized_base_path, "/structure"),
-        auto_close=auto_close,
-        share_url=share_url,
-        molstar_css_url=route_path(normalized_base_path, "/assets/molstar-4.5.0.css"),
-        molstar_js_url=route_path(normalized_base_path, "/assets/molstar-4.5.0.js"),
-        qrcode_js_url=route_path(normalized_base_path, "/assets/qrcode-generator-2.0.4.min.js"),
-        heartbeat_url=route_path(normalized_base_path, "/heartbeat"),
-        bye_url=route_path(normalized_base_path, "/bye"),
-        heartbeat_interval_ms=compute_heartbeat_interval_ms(idle_timeout),
-        watch=watch,
-        version_url=route_path(normalized_base_path, "/version"),
-        favicon_url=route_path(normalized_base_path, "/favicon.ico"),
-    ).encode("utf-8")
 
-    handler: type[BaseHTTPRequestHandler] = type(
+    handler: type[_Handler] = type(
         "Handler",
         (_Handler,),
         {
             "structure_source": structure_source,
-            "viewer_html_bytes": viewer_html_bytes,
             "shutdown_event": shutdown_event,
             "auto_close": auto_close,
+            "watch": watch,
             "base_path": normalized_base_path,
             "idle_timeout": idle_timeout,
             "bye_grace": bye_grace,
@@ -804,7 +1096,39 @@ def make_server(
     server_cls: type[HTTPServer] = (
         ThreadingIPv6HTTPServer if family == socket.AF_INET6 else ThreadingHTTPServer
     )
-    return server_cls((bind_host, port), handler)
+    server = server_cls((bind_host, port), handler)
+
+    fallback_share_url: str | None = None
+    if share_url is None:
+        lan_host = detect_lan_host(host)
+        if lan_host is not None:
+            chosen_port = server.server_address[1]
+            lan_origin = f"http://{format_host_for_url(lan_host)}:{chosen_port}"
+            fallback_share_url = (
+                f"{lan_origin}{route_path(normalized_base_path, '/')}"
+                if normalized_base_path
+                else lan_origin
+            )
+
+    handler.fallback_share_url = fallback_share_url
+    handler.viewer_html_bytes = render_viewer_html(
+        structure_name=structure_source.display_name,
+        format_key=structure_source.format_key,
+        file_url="./structure",
+        auto_close=auto_close,
+        share_url=share_url,
+        fallback_share_url=fallback_share_url,
+        molstar_css_url="./assets/molstar-4.5.0.css",
+        molstar_js_url="./assets/molstar-4.5.0.js",
+        qrcode_js_url="./assets/qrcode-generator-2.0.4.min.js",
+        heartbeat_url="./heartbeat",
+        bye_url="./bye",
+        heartbeat_interval_ms=compute_heartbeat_interval_ms(idle_timeout),
+        watch=watch,
+        version_url="./version",
+        favicon_url="./favicon.ico",
+    ).encode("utf-8")
+    return server
 
 
 def start_heartbeat_watchdog(
