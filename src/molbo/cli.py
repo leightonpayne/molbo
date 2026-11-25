@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import json
 import os
-import re
+import secrets
 import signal
+import subprocess
 import sys
+import tempfile
 import threading
+import time
 import webbrowser
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Literal, get_args
+from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 
+import segno
 import typer
 from rich.console import Console
 from rich.markup import escape as escape_markup
@@ -21,58 +26,41 @@ from rich.text import Text
 
 from molbo import __version__
 from molbo.server import (
+    SUPPORTED_EXTENSIONS,
+    SUPPORTED_FORMAT_KEYS,
+    SUPPORTED_SUFFIXES,
+    FormatChoice,
     StructureSource,
-    display_name_from_url,
+    alphafold_id_to_structure_source,
     format_host_for_url,
     local_access_host,
+    looks_like_alphafold_id,
+    looks_like_pdb_id,
+    looks_like_url,
     make_server,
     normalize_base_path,
+    pdb_id_to_structure_source,
+    resolve_source,
+    resolve_structure_format,
     route_path,
     serve_background,
     start_heartbeat_watchdog,
 )
 
-_BASE_SUFFIXES: dict[str, str] = {
-    ".pdb": "pdb",
-    ".ent": "pdb",
-    ".cif": "cif",
-    ".mmcif": "mmcif",
-    ".bcif": "bcif",
-    ".pdbqt": "pdbqt",
-    ".sdf": "sdf",
-    ".sd": "sdf",
-    ".mol": "mol",
-    ".mol2": "mol2",
-    ".xyz": "xyz",
-    ".gro": "gro",
-}
-SUPPORTED_SUFFIXES: dict[tuple[str, ...], str] = {
-    **{(ext,): fmt for ext, fmt in _BASE_SUFFIXES.items()},
-    **{(ext, ".gz"): fmt for ext, fmt in _BASE_SUFFIXES.items()},
-}
-SUPPORTED_EXTENSIONS = ", ".join("".join(suffixes) for suffixes in SUPPORTED_SUFFIXES)
-FormatChoice = Literal["pdb", "cif", "mmcif", "bcif", "pdbqt", "sdf", "mol", "mol2", "xyz", "gro"]
-SUPPORTED_FORMAT_KEYS: tuple[str, ...] = get_args(FormatChoice)
+_READY_FILE_ENV = "MOLBO_DETACH_READY_FILE"
+_STDIN_FILE_ENV = "MOLBO_DETACH_STDIN_FILE"
+_DETACH_TIMEOUT_SECONDS = 10.0
 
-_PDB_ID_RE = re.compile(r"^[0-9][A-Za-z0-9]{3}$")
-_EXTENDED_PDB_ID_RE = re.compile(r"^pdb_[A-Za-z0-9]{8}$", re.IGNORECASE)
-_ALPHAFOLD_PREFIX_RE = re.compile(r"^(?:af|alphafold):([A-Za-z0-9_-]+)$", re.IGNORECASE)
-_ALPHAFOLD_ENTRY_RE = re.compile(r"^AF-([A-Za-z0-9]+)-F(\d+)(?:-model_v(\d+))?$", re.IGNORECASE)
-
-_RCSB_DOWNLOAD_URLS: dict[str, tuple[str, str, str]] = {
-    "cif": ("https://files.rcsb.org/download/{pdb_id}.cif", "cif", "{pdb_id}.cif"),
-    "mmcif": ("https://files.rcsb.org/download/{pdb_id}.cif", "cif", "{pdb_id}.cif"),
-    "pdb": ("https://files.rcsb.org/download/{pdb_id}.pdb", "pdb", "{pdb_id}.pdb"),
-    "bcif": ("https://models.rcsb.org/{pdb_id}.bcif", "bcif", "{pdb_id}.bcif"),
-}
-_ALPHAFOLD_FORMATS: dict[str, str] = {
-    "cif": "cif",
-    "mmcif": "cif",
-    "pdb": "pdb",
-    "bcif": "bcif",
-}
-_ALPHAFOLD_API_URL = "https://alphafold.ebi.ac.uk/api/prediction/{uniprot}"
-_ALPHAFOLD_FILE_URL = "https://alphafold.ebi.ac.uk/files/{model_id}.{ext}"
+_HELP_EPILOG = """
+Examples:
+  molbo structure.pdb
+  molbo 1crn
+  molbo af:P69905 --format bcif
+  molbo design.cif --watch
+  molbo 1crn --host 0.0.0.0 --private --qr
+  molbo pred.cif --detach --auto-close --json
+  cat structure.cif | molbo - --format cif
+"""
 
 app = typer.Typer(
     name="molbo",
@@ -91,31 +79,10 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
-def _resolve_structure_format(file: Path) -> str | None:
-    suffixes = tuple(suffix.lower() for suffix in file.suffixes)
-    for width in (2, 1):
-        key = suffixes[-width:]
-        if key in SUPPORTED_SUFFIXES:
-            return SUPPORTED_SUFFIXES[key]
-    return None
-
-
-def _looks_like_url(value: str) -> bool:
-    parsed = urlparse(value)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
-
-
-def _looks_like_pdb_id(value: str) -> bool:
-    return (
-        _PDB_ID_RE.fullmatch(value) is not None or _EXTENDED_PDB_ID_RE.fullmatch(value) is not None
-    )
-
-
-def _looks_like_alphafold_id(value: str) -> bool:
-    return (
-        _ALPHAFOLD_PREFIX_RE.fullmatch(value) is not None
-        or _ALPHAFOLD_ENTRY_RE.fullmatch(value) is not None
-    )
+_resolve_structure_format = resolve_structure_format
+_looks_like_url = looks_like_url
+_looks_like_pdb_id = looks_like_pdb_id
+_looks_like_alphafold_id = looks_like_alphafold_id
 
 
 def _detect_headless_reason(
@@ -161,44 +128,59 @@ def _normalize_base_url(value: str | None) -> tuple[str | None, str]:
     return _viewer_url(origin, base_path), base_path
 
 
+def _apply_private_path(
+    base_url: str | None,
+    base_path: str,
+    token: str | None = None,
+) -> tuple[str | None, str]:
+    secret_token = token or secrets.token_urlsafe(12)
+    private_base_path = normalize_base_path(
+        f"{base_path}/{secret_token}" if base_path else f"/s/{secret_token}"
+    )
+    if base_url is None:
+        return None, private_base_path
+    parsed = urlparse(base_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    return _viewer_url(origin, private_base_path), private_base_path
+
+
+def _render_terminal_qr(url: str) -> Text:
+    qr = segno.make(url, error="m")
+    border = 2
+    matrix = [list(row) for row in qr.matrix]
+    width = len(matrix[0]) + border * 2
+    padded = [[0] * width for _ in range(border)]
+    for row in matrix:
+        padded.append([0] * border + row + [0] * border)
+    padded.extend([[0] * width for _ in range(border)])
+    if len(padded) % 2:
+        padded.append([0] * width)
+
+    blocks = {
+        (0, 0): " ",
+        (1, 0): "▀",
+        (0, 1): "▄",
+        (1, 1): "█",
+    }
+    lines = [
+        "".join(
+            blocks[(bool(top), bool(bottom))]
+            for top, bottom in zip(padded[i], padded[i + 1], strict=True)
+        )
+        for i in range(0, len(padded), 2)
+    ]
+    return Text("\n".join(lines), style="black on white")
+
+
 def _pdb_id_to_structure_source(
     value: str,
     fetch_timeout: float,
     format_override: str | None = None,
 ) -> StructureSource:
-    requested_format = (format_override or "cif").lower()
-    if requested_format not in _RCSB_DOWNLOAD_URLS:
-        raise typer.BadParameter(
-            "Unsupported --format for PDB IDs. Choose from cif, mmcif, pdb, or bcif."
-        )
-
-    is_extended = _EXTENDED_PDB_ID_RE.fullmatch(value) is not None
-    if is_extended:
-        pdb_id = value.lower()
-        if requested_format == "pdb":
-            if pdb_id.startswith("pdb_0000"):
-                short_id = pdb_id[8:].upper()
-                return StructureSource(
-                    display_name=f"{short_id}.pdb",
-                    format_key="pdb",
-                    remote_url=_RCSB_DOWNLOAD_URLS["pdb"][0].format(pdb_id=short_id),
-                    fetch_timeout=fetch_timeout,
-                    pdb_id=pdb_id,
-                )
-            raise typer.BadParameter(
-                "Extended PDB IDs only support cif, mmcif, or bcif downloads from RCSB."
-            )
-    else:
-        pdb_id = value.upper()
-
-    url_template, format_key, name_template = _RCSB_DOWNLOAD_URLS[requested_format]
-    return StructureSource(
-        display_name=name_template.format(pdb_id=pdb_id),
-        format_key=format_key,
-        remote_url=url_template.format(pdb_id=pdb_id),
-        fetch_timeout=fetch_timeout,
-        pdb_id=pdb_id,
-    )
+    try:
+        return pdb_id_to_structure_source(value, fetch_timeout, format_override=format_override)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 def _alphafold_id_to_structure_source(
@@ -206,50 +188,38 @@ def _alphafold_id_to_structure_source(
     fetch_timeout: float,
     format_override: str | None = None,
 ) -> StructureSource:
-    requested_format = (format_override or "cif").lower()
-    if requested_format not in _ALPHAFOLD_FORMATS:
+    try:
+        return alphafold_id_to_structure_source(
+            value, fetch_timeout, format_override=format_override
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _read_stdin_structure_source(format_override: str | None) -> StructureSource:
+    if format_override is None:
+        raise typer.BadParameter("--format is required when reading a structure from stdin ('-').")
+    fmt = format_override.lower()
+    if fmt not in SUPPORTED_FORMAT_KEYS:
         raise typer.BadParameter(
-            "Unsupported --format for AlphaFold DB IDs. Choose from cif, mmcif, pdb, or bcif."
+            f"Unsupported --format {format_override!r}. Choose from {', '.join(SUPPORTED_FORMAT_KEYS)}."
         )
-    format_key = _ALPHAFOLD_FORMATS[requested_format]
 
-    prefix_match = _ALPHAFOLD_PREFIX_RE.fullmatch(value)
-    if prefix_match is not None:
-        inner = prefix_match.group(1)
-        entry_match = _ALPHAFOLD_ENTRY_RE.fullmatch(inner)
-        if entry_match is None:
-            uniprot = inner.upper()
-            return StructureSource(
-                display_name=f"AF-{uniprot}.{format_key}",
-                format_key=format_key,
-                fetch_timeout=fetch_timeout,
-                alphafold_id=uniprot,
-                alphafold_api_url=_ALPHAFOLD_API_URL.format(uniprot=uniprot),
-            )
+    stdin_file_env = os.environ.get(_STDIN_FILE_ENV)
+    if stdin_file_env:
+        stdin_path = Path(stdin_file_env)
+        try:
+            data = stdin_path.read_bytes()
+        finally:
+            stdin_path.unlink(missing_ok=True)
     else:
-        entry_match = _ALPHAFOLD_ENTRY_RE.fullmatch(value)
+        data = sys.stdin.buffer.read()
 
-    assert entry_match is not None
-    uniprot = entry_match.group(1).upper()
-    fragment = entry_match.group(2)
-    version = entry_match.group(3)
-    entry_id = f"AF-{uniprot}-F{fragment}"
-    if version is not None:
-        model_id = f"{entry_id}-model_v{version}"
-        return StructureSource(
-            display_name=f"{model_id}.{format_key}",
-            format_key=format_key,
-            remote_url=_ALPHAFOLD_FILE_URL.format(model_id=model_id, ext=format_key),
-            fetch_timeout=fetch_timeout,
-            alphafold_id=model_id,
-        )
-    return StructureSource(
-        display_name=f"{entry_id}.{format_key}",
-        format_key=format_key,
-        fetch_timeout=fetch_timeout,
-        alphafold_id=entry_id,
-        alphafold_api_url=_ALPHAFOLD_API_URL.format(uniprot=uniprot),
-    )
+    if not data:
+        err_console.print("[bold red]Error:[/] No input received on stdin.")
+        raise typer.Exit(code=1)
+
+    return StructureSource(display_name=f"stdin.{fmt}", format_key=fmt, inline_bytes=data)
 
 
 def _resolve_structure_source(
@@ -257,46 +227,26 @@ def _resolve_structure_source(
     fetch_timeout: float,
     format_override: str | None = None,
 ) -> StructureSource | None:
-    if _looks_like_url(value):
-        display_name = display_name_from_url(value)
-        fmt = format_override or _resolve_structure_format(Path(display_name))
-        if fmt is None:
-            return None
-        return StructureSource(
-            display_name=display_name,
-            format_key=fmt,
-            remote_url=value,
-            fetch_timeout=fetch_timeout,
+    if value == "-":
+        return _read_stdin_structure_source(format_override)
+    try:
+        return resolve_source(value, fetch_timeout=fetch_timeout, format_override=format_override)
+    except IsADirectoryError:
+        err_console.print(
+            f"[bold red]Error:[/] Path is a directory, not a structure file: "
+            f"[yellow]{escape_markup(value)}[/]"
         )
-
-    path = Path(value).expanduser().resolve()
-    if path.exists():
-        if path.is_dir():
-            err_console.print(
-                f"[bold red]Error:[/] Path is a directory, not a structure file: "
-                f"[yellow]{escape_markup(value)}[/]"
-            )
-            raise typer.Exit(code=1)
-        if not path.is_file():
-            err_console.print(
-                f"[bold red]Error:[/] Path is not a regular file: [yellow]{escape_markup(value)}[/]"
-            )
-            raise typer.Exit(code=1)
-        fmt = format_override or _resolve_structure_format(path)
-        if fmt is None:
-            return None
-        return StructureSource(display_name=path.name, format_key=fmt, local_path=path)
-
-    if _looks_like_pdb_id(value):
-        return _pdb_id_to_structure_source(value, fetch_timeout, format_override=format_override)
-
-    if _looks_like_alphafold_id(value):
-        return _alphafold_id_to_structure_source(
-            value, fetch_timeout, format_override=format_override
+        raise typer.Exit(code=1) from None
+    except FileNotFoundError:
+        err_console.print(f"[bold red]Error:[/] File not found: [yellow]{escape_markup(value)}[/]")
+        raise typer.Exit(code=1) from None
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    except OSError:
+        err_console.print(
+            f"[bold red]Error:[/] Path is not a regular file: [yellow]{escape_markup(value)}[/]"
         )
-
-    err_console.print(f"[bold red]Error:[/] File not found: [yellow]{escape_markup(value)}[/]")
-    raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
 
 def _format_local_path_for_display(path: Path) -> str:
@@ -309,6 +259,8 @@ def _format_local_path_for_display(path: Path) -> str:
 
 
 def _display_source_label(source: StructureSource) -> str:
+    if source.is_inline:
+        return "stdin"
     if source.pdb_id is not None:
         return f"PDB ID {source.pdb_id}"
     if source.alphafold_id is not None:
@@ -348,14 +300,221 @@ def _build_info_grid(
     return info
 
 
-@app.command()
+def _build_session_payload(
+    *,
+    structure_source: StructureSource,
+    host: str,
+    port: int,
+    local_url: str,
+    share_url: str,
+    watch: bool,
+    private: bool,
+    auto_close: bool,
+    pid: int,
+) -> dict[str, Any]:
+    return {
+        "url": local_url,
+        "share_url": share_url,
+        "host": host,
+        "port": port,
+        "source": _display_source_label(structure_source),
+        "name": structure_source.display_name,
+        "format": structure_source.format_key,
+        "source_kind": structure_source.source_kind,
+        "watch": watch,
+        "private": private,
+        "auto_close": auto_close,
+        "pid": pid,
+    }
+
+
+def _emit_ready_ui(
+    *,
+    structure_source: StructureSource,
+    host: str,
+    port: int,
+    local_url: str,
+    share_url: str,
+    watch: bool,
+    private: bool,
+    effective_auto_close: bool,
+    heartbeat_timeout: float,
+    qr: bool,
+    json_output: bool,
+    no_open: bool,
+    pid: int,
+    detached: bool = False,
+) -> None:
+    if json_output:
+        payload = _build_session_payload(
+            structure_source=structure_source,
+            host=host,
+            port=port,
+            local_url=local_url,
+            share_url=share_url,
+            watch=watch,
+            private=private,
+            auto_close=effective_auto_close,
+            pid=pid,
+        )
+        print(json.dumps(payload), flush=True)
+    else:
+        info = _build_info_grid(
+            source=structure_source,
+            format_key=structure_source.format_key,
+            host=host,
+            local_url=local_url,
+            share_url=share_url,
+        )
+        subtitle_parts = [f"detached (PID {pid})" if detached else "Ctrl+C to quit"]
+        if private:
+            subtitle_parts.append("private link")
+        if watch:
+            subtitle_parts.append("watching for file changes")
+        if effective_auto_close:
+            subtitle_parts.append(f"auto-close after {heartbeat_timeout:g}s idle")
+        subtitle = f"[dim]{' • '.join(subtitle_parts)}[/dim]"
+
+        console.print()
+        console.print(
+            Panel(
+                info,
+                title="[bold]molbo[/bold]",
+                subtitle=subtitle,
+                border_style="bright_blue",
+                padding=(1, 2),
+            )
+        )
+        if qr:
+            console.print(_render_terminal_qr(share_url))
+
+    if not no_open:
+        headless_reason = _detect_headless_reason()
+        if headless_reason == "ssh":
+            if not json_output:
+                console.print(
+                    f"[dim]SSH session detected; skipping browser launch. "
+                    f"Forward locally with:[/] [bold]{escape_markup(_ssh_forward_hint(host, port))}[/]"
+                )
+        elif headless_reason == "headless":
+            if not json_output:
+                console.print(
+                    f"[dim]Headless environment detected; skipping browser launch. "
+                    f"Open[/] [underline]{escape_markup(local_url)}[/] [dim]manually.[/]"
+                )
+        elif not webbrowser.open(local_url) and not json_output:
+            err_console.print(
+                f"[yellow]Warning:[/] Could not auto-open a browser. "
+                f"Open [underline]{escape_markup(local_url)}[/] manually."
+            )
+
+
+def _spawn_detached_server(
+    *,
+    source: str,
+    structure_source: StructureSource,
+    port: int | None,
+    host: str,
+    watch: bool,
+    auto_close: bool | None,
+    idle_timeout: float | None,
+    fetch_timeout: float,
+    format_override: str | None,
+    base_url: str | None,
+    private: bool,
+) -> dict[str, Any]:
+    cmd = [sys.executable, "-m", "molbo", source, "--host", host, "--no-open"]
+    if port is not None:
+        cmd.extend(["--port", str(port)])
+    if watch:
+        cmd.append("--watch")
+    if auto_close is True:
+        cmd.append("--auto-close")
+    elif auto_close is False:
+        cmd.append("--keep-alive")
+    if idle_timeout is not None:
+        cmd.extend(["--idle-timeout", str(idle_timeout)])
+    if fetch_timeout != 30.0:
+        cmd.extend(["--fetch-timeout", str(fetch_timeout)])
+    if format_override is not None:
+        cmd.extend(["--format", format_override])
+    if base_url is not None:
+        cmd.extend(["--base-url", base_url])
+    if private:
+        cmd.append("--private")
+
+    with tempfile.NamedTemporaryFile(prefix="molbo-ready-", suffix=".json", delete=False) as tf:
+        ready_path = Path(tf.name)
+    with tempfile.NamedTemporaryFile(prefix="molbo-err-", suffix=".log", delete=False) as ef:
+        err_path = Path(ef.name)
+
+    stdin_path: Path | None = None
+    env = os.environ.copy()
+    env[_READY_FILE_ENV] = str(ready_path)
+    if structure_source.inline_bytes is not None:
+        with tempfile.NamedTemporaryFile(prefix="molbo-stdin-", delete=False) as sf:
+            sf.write(structure_source.inline_bytes)
+            stdin_path = Path(sf.name)
+        env[_STDIN_FILE_ENV] = str(stdin_path)
+
+    popen_kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "env": env,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        ) | getattr(subprocess, "DETACHED_PROCESS", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    try:
+        with err_path.open("wb") as err_handle:
+            popen_kwargs["stderr"] = err_handle
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+
+        deadline = time.monotonic() + _DETACH_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if ready_path.exists():
+                raw = ready_path.read_text(encoding="utf-8").strip()
+                if raw:
+                    try:
+                        payload = json.loads(raw)
+                        if isinstance(payload, dict):
+                            return payload
+                    except json.JSONDecodeError:
+                        pass
+            exit_code = proc.poll()
+            if exit_code is not None:
+                err_text = err_path.read_text(encoding="utf-8", errors="replace").strip()
+                if err_text:
+                    err_console.print(err_text, markup=False)
+                else:
+                    err_console.print(
+                        f"[bold red]Error:[/] Detached molbo server exited with code {exit_code}."
+                    )
+                raise typer.Exit(code=exit_code or 1)
+            time.sleep(0.02)
+
+        proc.terminate()
+        err_console.print("[bold red]Error:[/] Timed out waiting for detached molbo server.")
+        raise typer.Exit(code=1)
+    finally:
+        ready_path.unlink(missing_ok=True)
+        err_path.unlink(missing_ok=True)
+        if stdin_path is not None and stdin_path.exists():
+            stdin_path.unlink(missing_ok=True)
+
+
+@app.command(epilog=_HELP_EPILOG)
 def view(
     source: Annotated[
         str,
         typer.Argument(
             help=(
-                "Local path, PDB ID (e.g. 1crn or pdb_00001crn), AlphaFold ID "
-                "(e.g. af:P12345 or AF-P12345-F1), or http(s) URL."
+                "Local path, '-' for stdin, PDB ID (e.g. 1crn or pdb_00001crn), "
+                "AlphaFold ID (e.g. af:P12345 or AF-P12345-F1), or http(s) URL."
             ),
         ),
     ],
@@ -407,7 +566,7 @@ def view(
         typer.Option(
             "--format",
             case_sensitive=False,
-            help="Explicit structure format for extensionless inputs or database ID downloads.",
+            help="Explicit structure format for extensionless inputs, stdin, or database IDs.",
         ),
     ] = None,
     base_url: Annotated[
@@ -417,6 +576,34 @@ def view(
             help="Public viewer URL to display and encode in the QR modal, e.g. https://mol.example.com or https://mol.example.com/s/demo.",
         ),
     ] = None,
+    private: Annotated[
+        bool,
+        typer.Option(
+            "--private",
+            help="Mount the session under a random unguessable URL path prefix.",
+        ),
+    ] = False,
+    qr: Annotated[
+        bool,
+        typer.Option(
+            "--qr",
+            help="Print a scannable QR code for the share URL in the terminal.",
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print session info as a single JSON line to stdout once the server is listening.",
+        ),
+    ] = False,
+    detach: Annotated[
+        bool,
+        typer.Option(
+            "--detach",
+            help="Run the server in a detached background process and exit once it is listening.",
+        ),
+    ] = False,
     version: Annotated[  # noqa: ARG001
         bool | None,
         typer.Option(
@@ -428,7 +615,7 @@ def view(
     if auto_close is False and idle_timeout is not None:
         raise typer.BadParameter("--idle-timeout cannot be combined with --keep-alive.")
 
-    base_url, base_path = _normalize_base_url(base_url)
+    normalized_base_url, base_path = _normalize_base_url(base_url)
     format_override_str = format_override.lower() if format_override is not None else None
 
     structure_source = _resolve_structure_source(
@@ -444,13 +631,48 @@ def view(
         )
         raise typer.Exit(code=1)
 
-    if watch and structure_source.is_remote:
+    if watch and (structure_source.is_remote or structure_source.is_inline):
         raise typer.BadParameter("--watch is only supported for local structure files.")
 
     effective_auto_close = bool(auto_close) or idle_timeout is not None
     heartbeat_timeout = idle_timeout if idle_timeout is not None else 15.0
-    shutdown_event = threading.Event()
 
+    if detach:
+        payload = _spawn_detached_server(
+            source=source,
+            structure_source=structure_source,
+            port=port,
+            host=host,
+            watch=watch,
+            auto_close=auto_close,
+            idle_timeout=idle_timeout,
+            fetch_timeout=fetch_timeout,
+            format_override=format_override_str,
+            base_url=normalized_base_url,
+            private=private,
+        )
+        _emit_ready_ui(
+            structure_source=structure_source,
+            host=str(payload["host"]),
+            port=int(payload["port"]),
+            local_url=str(payload["url"]),
+            share_url=str(payload["share_url"]),
+            watch=watch,
+            private=private,
+            effective_auto_close=effective_auto_close,
+            heartbeat_timeout=heartbeat_timeout,
+            qr=qr,
+            json_output=json_output,
+            no_open=no_open,
+            pid=int(payload["pid"]),
+            detached=True,
+        )
+        return
+
+    if private:
+        normalized_base_url, base_path = _apply_private_path(normalized_base_url, base_path)
+
+    shutdown_event = threading.Event()
     try:
         server = make_server(
             structure_source,
@@ -458,7 +680,7 @@ def view(
             host=host,
             shutdown_event=shutdown_event,
             auto_close=effective_auto_close,
-            share_url=base_url,
+            share_url=normalized_base_url,
             base_path=base_path,
             idle_timeout=heartbeat_timeout,
             watch=watch,
@@ -475,56 +697,49 @@ def view(
     chosen_port = server.server_address[1]
     local_origin = f"http://{format_host_for_url(local_access_host(host))}:{chosen_port}"
     local_url = _viewer_url(local_origin, base_path)
-    share_url = base_url or local_url
-
-    info = _build_info_grid(
-        source=structure_source,
-        format_key=structure_source.format_key,
-        host=host,
-        local_url=local_url,
-        share_url=share_url,
-    )
-    subtitle_parts = ["Ctrl+C to quit"]
-    if watch:
-        subtitle_parts.append("watching for file changes")
-    if effective_auto_close:
-        subtitle_parts.append(f"auto-close after {heartbeat_timeout:g}s idle")
-    subtitle = f"[dim]{' • '.join(subtitle_parts)}[/dim]"
-
-    console.print()
-    console.print(
-        Panel(
-            info,
-            title="[bold]molbo[/bold]",
-            subtitle=subtitle,
-            border_style="bright_blue",
-            padding=(1, 2),
-        )
-    )
+    fallback_share_url = getattr(server.RequestHandlerClass, "fallback_share_url", None)
+    share_url = normalized_base_url or fallback_share_url or local_url
 
     server_thread = serve_background(server)
 
     if effective_auto_close:
-        handler_cls = server.RequestHandlerClass
-        start_heartbeat_watchdog(handler_cls, shutdown_event, timeout=heartbeat_timeout)
+        start_heartbeat_watchdog(
+            server.RequestHandlerClass, shutdown_event, timeout=heartbeat_timeout
+        )
 
-    if not no_open:
-        headless_reason = _detect_headless_reason()
-        if headless_reason == "ssh":
-            console.print(
-                f"[dim]SSH session detected; skipping browser launch. "
-                f"Forward locally with:[/] [bold]{escape_markup(_ssh_forward_hint(host, chosen_port))}[/]"
-            )
-        elif headless_reason == "headless":
-            console.print(
-                f"[dim]Headless environment detected; skipping browser launch. "
-                f"Open[/] [underline]{escape_markup(local_url)}[/] [dim]manually.[/]"
-            )
-        elif not webbrowser.open(local_url):
-            err_console.print(
-                f"[yellow]Warning:[/] Could not auto-open a browser. "
-                f"Open [underline]{escape_markup(local_url)}[/] manually."
-            )
+    ready_file_env = os.environ.get(_READY_FILE_ENV)
+    if ready_file_env:
+        payload = _build_session_payload(
+            structure_source=structure_source,
+            host=host,
+            port=chosen_port,
+            local_url=local_url,
+            share_url=share_url,
+            watch=watch,
+            private=private,
+            auto_close=effective_auto_close,
+            pid=os.getpid(),
+        )
+        ready_path = Path(ready_file_env)
+        tmp_path = ready_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+        tmp_path.replace(ready_path)
+    else:
+        _emit_ready_ui(
+            structure_source=structure_source,
+            host=host,
+            port=chosen_port,
+            local_url=local_url,
+            share_url=share_url,
+            watch=watch,
+            private=private,
+            effective_auto_close=effective_auto_close,
+            heartbeat_timeout=heartbeat_timeout,
+            qr=qr,
+            json_output=json_output,
+            no_open=no_open,
+            pid=os.getpid(),
+        )
 
     previous_sigterm = None
     has_sigterm = (
@@ -544,11 +759,14 @@ def view(
         if has_sigterm and previous_sigterm is not None:
             signal.signal(signal.SIGTERM, previous_sigterm)
         shutdown_event.set()
-        console.print("\n[dim]Shutting down…[/dim]")
+        if not ready_file_env and not json_output:
+            console.print("\n[dim]Shutting down…[/dim]")
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=1.0)
 
+
+__all__ = ["SUPPORTED_EXTENSIONS", "SUPPORTED_FORMAT_KEYS", "SUPPORTED_SUFFIXES", "app", "view"]
 
 if __name__ == "__main__":
     app()
