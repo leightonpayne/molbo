@@ -33,7 +33,7 @@ dependencies = [
 ]
 
 [project.urls]
-Documentation = "https://leightonpayne.github.io/molbo/"
+Documentation = "https://molbo.leightonpayne.dev/"
 Issues = "https://github.com/leightonpayne/molbo/issues"
 Repository = "https://github.com/leightonpayne/molbo"
 

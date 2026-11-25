@@ -1,6 +1,6 @@
 [project]
 site_name = "Molbo"
-site_url = "https://leightonpayne.github.io/molbo"
+site_url = "https://molbo.leightonpayne.dev"
 site_description = "Quickly open PDB/CIF files in Mol* from the terminal."
 repo_name = "leightonpayne/molbo"
 repo_url = "https://github.com/leightonpayne/molbo"
