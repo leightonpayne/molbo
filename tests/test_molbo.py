@@ -4,6 +4,7 @@ import gzip
 import http.client
 import io
 import json
+import re
 import socket
 import tempfile
 import threading
@@ -41,6 +42,12 @@ from molbo.server import (
     serve_background,
     start_heartbeat_watchdog,
 )
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain_output(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 
 class RenderViewerHtmlTests(unittest.TestCase):
@@ -565,7 +572,9 @@ class CliTests(unittest.TestCase):
         runner = CliRunner()
         result = runner.invoke(app, ["1crn", "--watch"])
         self.assertNotEqual(result.exit_code, 0)
-        self.assertIn("--watch is only supported for local structure files", result.output)
+        self.assertIn(
+            "--watch is only supported for local structure files", _plain_output(result.output)
+        )
 
     def test_detect_headless_reason_and_ssh_hint(self) -> None:
         self.assertEqual(_detect_headless_reason({"SSH_CONNECTION": "1 2 3 4"}, "darwin"), "ssh")
@@ -623,13 +632,15 @@ class CliTests(unittest.TestCase):
         runner = CliRunner()
         result = runner.invoke(app, ["1crn", "--keep-alive", "--idle-timeout", "5"])
         self.assertNotEqual(result.exit_code, 0)
-        self.assertIn("--idle-timeout cannot be combined with --keep-alive", result.output)
+        self.assertIn(
+            "--idle-timeout cannot be combined with --keep-alive", _plain_output(result.output)
+        )
 
     def test_cli_escapes_rich_markup_in_error_messages(self) -> None:
         runner = CliRunner()
         result = runner.invoke(app, ["missing[/red].pdb"])
         self.assertEqual(result.exit_code, 1)
-        self.assertIn("missing[/red].pdb", result.output)
+        self.assertIn("missing[/red].pdb", _plain_output(result.output))
 
     def test_display_source_label_matches_resolved_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -938,9 +949,15 @@ class PrefixedServerTests(unittest.TestCase):
                 self.assertEqual(ctx.exception.code, 404)
                 ctx.exception.close()
 
-                opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler)
-                with opener.open(f"http://127.0.0.1:{port}/s/demo") as response:
-                    self.assertEqual(response.geturl(), f"http://127.0.0.1:{port}/s/demo/")
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                try:
+                    conn.request("GET", "/s/demo")
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 308)
+                    self.assertEqual(response.getheader("Location"), "/s/demo/")
+                    response.read()
+                finally:
+                    conn.close()
             finally:
                 shutdown_event.set()
                 server.shutdown()
