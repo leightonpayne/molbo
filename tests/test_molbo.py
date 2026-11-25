@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import contextlib
 import gzip
 import http.client
 import io
 import json
+import os
 import re
+import signal
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -21,12 +26,15 @@ from unittest import mock
 import typer
 from typer.testing import CliRunner
 
+import molbo
 from molbo import __version__
 from molbo.cli import (
+    _apply_private_path,
     _build_info_grid,
     _detect_headless_reason,
     _display_source_label,
     _normalize_base_url,
+    _render_terminal_qr,
     _resolve_structure_source,
     _ssh_forward_hint,
     app,
@@ -36,6 +44,7 @@ from molbo.server import (
     _accepts_gzip,
     _guess_mime,
     compute_heartbeat_interval_ms,
+    detect_lan_host,
     local_access_host,
     make_server,
     render_viewer_html,
@@ -56,9 +65,10 @@ class RenderViewerHtmlTests(unittest.TestCase):
         rendered = render_viewer_html(
             structure_name=filename,
             format_key="pdb",
-            file_url="/structure",
+            file_url="./structure",
             auto_close=False,
             share_url="https://mol.example.com",
+            fallback_share_url="http://192.168.1.42:8080",
             heartbeat_interval_ms=3000,
         )
 
@@ -68,29 +78,40 @@ class RenderViewerHtmlTests(unittest.TestCase):
             'var STRUCTURE_NAME = "bad\\"\\u003e\\u003cscript\\u003ealert(1)\\u003c/script\\u003e.pdb";',
             rendered,
         )
-        self.assertIn('var FILE_URL = "/structure";', rendered)
+        self.assertIn('var FILE_URL = "./structure";', rendered)
         self.assertIn('var FORMAT_KEY = "pdb";', rendered)
         self.assertIn("var AUTO_CLOSE = false;", rendered)
-        self.assertIn(
-            'var SHARE_URL = "https://mol.example.com" || window.location.href;', rendered
-        )
+        self.assertIn('var EXPLICIT_SHARE_URL = "https://mol.example.com";', rendered)
+        self.assertIn('var FALLBACK_SHARE_URL = "http://192.168.1.42:8080";', rendered)
         self.assertIn("var HEARTBEAT_INTERVAL_MS = 3000;", rendered)
         self.assertIn("{ label: STRUCTURE_NAME }", rendered)
         self.assertIn('id="qr-button"', rendered)
         self.assertIn('id="qr-modal"', rendered)
         self.assertIn('id="qr-copy"', rendered)
         self.assertIn('id="qr-close"', rendered)
+        self.assertIn('id="qr-include-view"', rendered)
+        self.assertIn('id="download-button"', rendered)
         self.assertIn('id="reload-button"', rendered)
-        self.assertIn('href="/favicon.ico"', rendered)
+        self.assertIn('href="./favicon.ico"', rendered)
         self.assertIn("var WATCH_ENABLED = false;", rendered)
-        self.assertIn('var VERSION_URL = "/version";', rendered)
+        self.assertIn('var VERSION_URL = "./version";', rendered)
         self.assertIn("'pdbqt': 'pdbqt'", rendered)
         self.assertIn("'sdf':   'sdf'", rendered)
         self.assertIn("'mol2':  'mol2'", rendered)
         self.assertIn("'gro':   'gro'", rendered)
-        self.assertIn('src="/assets/molstar-4.5.0.js"', rendered)
-        self.assertIn('href="/assets/molstar-4.5.0.css"', rendered)
+        self.assertIn('src="./assets/molstar-4.5.0.js"', rendered)
+        self.assertIn('href="./assets/molstar-4.5.0.css"', rendered)
         self.assertIn("applyPublicationLook", rendered)
+        self.assertIn("encodeCameraHash", rendered)
+        self.assertIn("decodeCameraHash", rendered)
+        self.assertIn("window.molbo = {", rendered)
+        self.assertIn("ready: readyPromise", rendered)
+        self.assertIn("getShareUrl:", rendered)
+
+    def test_render_viewer_html_strips_gz_from_download_filename(self) -> None:
+        rendered = render_viewer_html(structure_name="example.pdb.gz", format_key="pdb")
+        self.assertIn('download="example.pdb"', rendered)
+        self.assertIn('title="example.pdb.gz"', rendered)
 
     def test_render_viewer_html_escapes_script_breakout_and_prevents_double_replacement(
         self,
@@ -128,9 +149,7 @@ class RenderViewerHtmlTests(unittest.TestCase):
         self.assertIn("var AUTO_CLOSE = true;", rendered)
         self.assertIn("var WATCH_ENABLED = true;", rendered)
         self.assertIn('var VERSION_URL = "/s/demo/version";', rendered)
-        self.assertIn(
-            'var SHARE_URL = "https://mol.example.com/s/demo/" || window.location.href;', rendered
-        )
+        self.assertIn('var EXPLICIT_SHARE_URL = "https://mol.example.com/s/demo/";', rendered)
         self.assertIn('var HEARTBEAT_URL = "/s/demo/heartbeat";', rendered)
         self.assertIn('var BYE_URL = "/s/demo/bye";', rendered)
         self.assertIn('src="/s/demo/assets/molstar-4.5.0.js"', rendered)
@@ -160,10 +179,11 @@ class ServerIntegrationTests(unittest.TestCase):
 
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/") as response:
                     self.assertEqual(response.status, 200)
+                    self.assertEqual(response.headers.get("X-Robots-Tag"), "noindex, nofollow")
                     html = response.read().decode("utf-8")
                 self.assertIn("example.pdb", html)
                 self.assertIn("var AUTO_CLOSE = false;", html)
-                self.assertIn('var FILE_URL = "/structure";', html)
+                self.assertIn('var FILE_URL = "./structure";', html)
 
                 head_req = urllib.request.Request(f"http://127.0.0.1:{port}/", method="HEAD")
                 with urllib.request.urlopen(head_req) as response:
@@ -201,6 +221,7 @@ class ServerIntegrationTests(unittest.TestCase):
 
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/structure") as response:
                     self.assertEqual(response.status, 200)
+                    self.assertEqual(response.headers.get("X-Robots-Tag"), "noindex, nofollow")
                     self.assertEqual(response.read(), structure_bytes)
 
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/favicon.ico") as response:
@@ -219,6 +240,17 @@ class ServerIntegrationTests(unittest.TestCase):
                     self.assertEqual(response.status, 200)
                     v1 = json.loads(response.read().decode("utf-8"))["version"]
                 self.assertIsNotNone(v1)
+
+                for endpoint in ("/info", "/health"):
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}{endpoint}") as response:
+                        self.assertEqual(response.status, 200)
+                        info = json.loads(response.read().decode("utf-8"))
+                    self.assertEqual(info["status"], "ok")
+                    self.assertEqual(info["name"], "example.pdb")
+                    self.assertEqual(info["format"], "pdb")
+                    self.assertEqual(info["source_kind"], "local")
+                    self.assertFalse(info["watch"])
+                    self.assertFalse(info["auto_close"])
 
                 structure_path.write_bytes(b"HEADER updated structure content\nEND\n")
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/version") as response:
@@ -329,6 +361,44 @@ class ServerIntegrationTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=1.0)
+
+    def test_detect_lan_host_and_wildcard_fallback_share_url(self) -> None:
+        self.assertIsNone(detect_lan_host("127.0.0.1"))
+        self.assertIsNone(detect_lan_host("100.64.0.1"))
+
+        fake_sock = mock.MagicMock()
+        fake_sock.__enter__.return_value = fake_sock
+        fake_sock.getsockname.return_value = ("192.168.1.42", 12345)
+        with mock.patch("molbo.server.socket.socket", return_value=fake_sock):
+            self.assertEqual(detect_lan_host("0.0.0.0"), "192.168.1.42")
+
+        fake_sock.connect.side_effect = OSError("no route")
+        with mock.patch("molbo.server.socket.socket", return_value=fake_sock):
+            self.assertIsNone(detect_lan_host("0.0.0.0"))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            structure_path = Path(tmpdir) / "example.pdb"
+            structure_path.write_bytes(b"HEADER lan\nEND\n")
+            with mock.patch("molbo.server.detect_lan_host", return_value="192.168.1.42"):
+                server = make_server(
+                    StructureSource(
+                        display_name=structure_path.name,
+                        format_key="pdb",
+                        local_path=structure_path,
+                    ),
+                    0,
+                    host="0.0.0.0",
+                )
+            try:
+                port = server.server_address[1]
+                expected = f"http://192.168.1.42:{port}"
+                self.assertEqual(
+                    getattr(server.RequestHandlerClass, "fallback_share_url", None), expected
+                )
+                html = getattr(server.RequestHandlerClass, "viewer_html_bytes", b"").decode("utf-8")
+                self.assertIn(f'var FALLBACK_SHARE_URL = "{expected}";', html)
+            finally:
+                server.server_close()
 
 
 class LifecycleTests(unittest.TestCase):
@@ -676,6 +746,162 @@ class CliTests(unittest.TestCase):
         self.assertEqual(local_access_host("[::]"), "::1")
         self.assertEqual(local_access_host("100.64.0.1"), "100.64.0.1")
 
+    def test_apply_private_path_generates_secret_prefix(self) -> None:
+        share_url, base_path = _apply_private_path(None, "", token="tok123")
+        self.assertIsNone(share_url)
+        self.assertEqual(base_path, "/s/tok123")
+
+        share_url, base_path = _apply_private_path("https://mol.example.com", "", token="tok123")
+        self.assertEqual(share_url, "https://mol.example.com/s/tok123/")
+        self.assertEqual(base_path, "/s/tok123")
+
+        share_url, base_path = _apply_private_path(
+            "https://mol.example.com/team/", "/team", token="tok123"
+        )
+        self.assertEqual(share_url, "https://mol.example.com/team/tok123/")
+        self.assertEqual(base_path, "/team/tok123")
+
+    def test_render_terminal_qr_produces_half_block_qr_text(self) -> None:
+        qr_text = _render_terminal_qr("https://mol.example.com/s/demo/")
+        self.assertEqual(qr_text.style, "black on white")
+        lines = qr_text.plain.splitlines()
+        self.assertGreater(len(lines), 10)
+        self.assertTrue(any(ch in qr_text.plain for ch in ("█", "▀", "▄")))
+
+    def test_cli_help_includes_examples(self) -> None:
+        result = CliRunner().invoke(app, ["--help"])
+        self.assertEqual(result.exit_code, 0)
+        plain = _plain_output(result.output)
+        self.assertIn("Examples:", plain)
+        self.assertIn("af:P69905", plain)
+        self.assertIn("--detach --auto-close --json", plain)
+
+    def test_cli_stdin_requires_format_and_rejects_watch(self) -> None:
+        runner = CliRunner()
+        res_no_fmt = runner.invoke(app, ["-"], input="HEADER x\nEND\n")
+        self.assertNotEqual(res_no_fmt.exit_code, 0)
+        self.assertIn("--format is required", _plain_output(res_no_fmt.output))
+
+        res_watch = runner.invoke(app, ["-", "--format", "pdb", "--watch"], input="HEADER x\nEND\n")
+        self.assertNotEqual(res_watch.exit_code, 0)
+        self.assertIn("--watch is only supported for local", _plain_output(res_watch.output))
+
+    def test_cli_detach_json_launches_and_exits_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            structure_path = Path(tmpdir) / "detached.pdb"
+            structure_bytes = b"HEADER detached\nEND\n"
+            structure_path.write_bytes(structure_bytes)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "molbo",
+                    str(structure_path),
+                    "--detach",
+                    "--no-open",
+                    "--json",
+                    "--private",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+            payload = json.loads(completed.stdout.strip())
+            pid = int(payload["pid"])
+            try:
+                self.assertTrue(payload["private"])
+                self.assertEqual(payload["format"], "pdb")
+                self.assertEqual(payload["source_kind"], "local")
+                url = payload["url"]
+                self.assertIn("/s/", url)
+
+                with urllib.request.urlopen(f"{url}info") as response:
+                    info = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(info["status"], "ok")
+                self.assertEqual(info["name"], "detached.pdb")
+
+                with urllib.request.urlopen(f"{url}structure") as response:
+                    self.assertEqual(response.read(), structure_bytes)
+            finally:
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGTERM)
+
+    def test_cli_detach_stdin_gzipped_payload(self) -> None:
+        raw_pdb = b"HEADER piped stdin\nEND\n"
+        gz_pdb = gzip.compress(raw_pdb)
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "molbo",
+                "-",
+                "--format",
+                "pdb",
+                "--detach",
+                "--no-open",
+                "--json",
+            ],
+            input=gz_pdb,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr.decode("utf-8", "replace"))
+        payload = json.loads(completed.stdout.decode("utf-8").strip())
+        pid = int(payload["pid"])
+        try:
+            self.assertEqual(payload["source"], "stdin")
+            self.assertEqual(payload["source_kind"], "stdin")
+            url = payload["url"]
+
+            with urllib.request.urlopen(f"{url}/structure") as response:
+                self.assertEqual(response.headers.get("Content-Encoding"), "gzip")
+                self.assertEqual(gzip.decompress(response.read()), raw_pdb)
+
+            with urllib.request.urlopen(f"{url}/info") as response:
+                info = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(info["source_kind"], "stdin")
+        finally:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGTERM)
+
+
+class PythonApiTests(unittest.TestCase):
+    def test_serve_context_manager_for_local_file_and_raw_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "api.cif"
+            data = b"data_api\n#\n"
+            path.write_bytes(data)
+
+            with molbo.serve(path) as session:
+                self.assertGreater(session.port, 0)
+                with urllib.request.urlopen(f"{session.url}/structure") as response:
+                    self.assertEqual(response.read(), data)
+                with urllib.request.urlopen(f"{session.url}/info") as response:
+                    info = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(info["format"], "cif")
+                self.assertEqual(info["source_kind"], "local")
+
+        raw = b"HEADER inline\nEND\n"
+        with molbo.serve(raw, format="pdb", name="pose.pdb", private=True) as session:
+            self.assertIn("/s/", session.url)
+            with urllib.request.urlopen(f"{session.url}structure") as response:
+                self.assertEqual(response.read(), raw)
+            with urllib.request.urlopen(f"{session.url}info") as response:
+                info = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(info["name"], "pose.pdb")
+            self.assertEqual(info["source_kind"], "stdin")
+
+    def test_serve_validates_raw_bytes_format_and_watch(self) -> None:
+        with self.assertRaises(ValueError):
+            molbo.serve(b"HEADER x\nEND\n")
+        with self.assertRaises(ValueError):
+            molbo.serve("1crn", watch=True)
+
 
 class MimeTests(unittest.TestCase):
     def test_explicit_format_supplies_mime_for_extensionless_name(self) -> None:
@@ -928,9 +1154,10 @@ class PrefixedServerTests(unittest.TestCase):
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/s/demo/") as response:
                     self.assertEqual(response.status, 200)
                     html = response.read().decode("utf-8")
-                self.assertIn('var FILE_URL = "/s/demo/structure";', html)
-                self.assertIn('src="/s/demo/assets/molstar-4.5.0.js"', html)
-                self.assertIn('var HEARTBEAT_URL = "/s/demo/heartbeat";', html)
+                self.assertIn('var FILE_URL = "./structure";', html)
+                self.assertIn('src="./assets/molstar-4.5.0.js"', html)
+                self.assertIn('var HEARTBEAT_URL = "./heartbeat";', html)
+                self.assertIn('var EXPLICIT_SHARE_URL = "https://mol.example.com/s/demo/";', html)
 
                 with urllib.request.urlopen(
                     f"http://127.0.0.1:{port}/s/demo/assets/molstar-4.5.0.css"
