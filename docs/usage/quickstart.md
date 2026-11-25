@@ -50,6 +50,21 @@ Watch a local file and live-reload the viewer on save:
 molbo output.pdb --watch
 ```
 
+Launch in the background and print JSON session info (useful for scripts and AI agents):
+
+```bash
+molbo pred.cif --detach --auto-close --json
+```
+
+Or launch programmatically from Python:
+
+```python
+import molbo
+
+with molbo.serve("1crn") as session:
+    print(session.url)
+```
+
 ## CLI options
 
 | Option | Default | Description |
@@ -61,6 +76,10 @@ molbo output.pdb --watch
 | `--auto-close` / `--keep-alive` | `--keep-alive` | Shut down automatically after the last browser tab closes or goes idle. |
 | `--idle-timeout` | `15` seconds | Seconds without browser activity before auto-close (implies `--auto-close`). |
 | `--fetch-timeout` | `30` seconds | Timeout for downloading remote structures. |
-| `--format` | inferred | Explicit format (`pdb`, `cif`, `mmcif`, `bcif`, `pdbqt`, `sdf`, `mol`, `mol2`, `xyz`, `gro`) for extensionless inputs or database IDs. |
+| `--format` | inferred | Explicit format (`pdb`, `cif`, `mmcif`, `bcif`, `pdbqt`, `sdf`, `mol`, `mol2`, `xyz`, `gro`) for extensionless inputs, stdin (`-`), or database IDs. |
 | `--base-url` | none | Public viewer URL shown in the banner and QR modal; any path prefix is also used for routing. |
+| `--private` | off | Mount the session under a random unguessable URL path prefix (e.g. `/s/<token>/`). |
+| `--qr` | off | Print a scannable QR code for the share URL directly in the terminal. |
+| `--json` | off | Print session metadata as a single JSON line to stdout once the server is listening. |
+| `--detach` | off | Run the server in a detached background process and exit once it is listening. |
 | `--version`, `-v` | — | Print the installed `molbo` version and exit. |

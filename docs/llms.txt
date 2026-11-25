@@ -1,0 +1,101 @@
+# molbo
+
+> Lightweight command-line and Python launcher for interactive 3D molecular structure viewing in Mol* using vendored offline frontend assets.
+
+## Install or run
+
+```bash
+uvx molbo 1crn
+uv tool install molbo
+pip install molbo
+```
+
+## Quick recipes for AI agents
+
+Launch a detached, auto-closing viewer and get structured JSON immediately (non-blocking):
+
+```bash
+molbo structure.cif --detach --auto-close --json
+```
+
+JSON output shape on `stdout`:
+
+```json
+{"url": "http://127.0.0.1:54321", "share_url": "http://127.0.0.1:54321", "host": "127.0.0.1", "port": 54321, "source": "~/structure.cif", "name": "structure.cif", "format": "cif", "source_kind": "local", "watch": false, "private": false, "auto_close": true, "pid": 12345}
+```
+
+Watch a local file while iterating (reloads automatically without losing camera angle):
+
+```bash
+molbo candidate.cif --watch --detach --json
+```
+
+Pipe a structure from stdin without creating a temp file:
+
+```bash
+cat model.pdb | molbo - --format pdb --detach --json
+```
+
+Share over LAN or behind a tunnel with an unguessable URL and terminal QR code:
+
+```bash
+molbo 1crn --host 0.0.0.0 --private --qr --no-open
+molbo secret.cif --port 8080 --no-open --private --base-url https://my-host.ts.net --qr
+```
+
+## Supported inputs
+
+- Local files (and `.gz` compressed variants): `.pdb`, `.ent`, `.cif`, `.mmcif`, `.bcif`, `.pdbqt`, `.sdf`, `.sd`, `.mol`, `.mol2`, `.xyz`, `.gro`
+- Stdin: `-` (requires `--format`; gzip bytes auto-detected)
+- Standard 4-char PDB IDs: `1crn`, `9QXS` (supports `--format cif|mmcif|pdb|bcif`)
+- Extended 12-char wwPDB IDs: `pdb_00001crn`
+- AlphaFold DB IDs: `af:P69905`, `alphafold:P69905`, `AF-P69905-F1`, `AF-P69905-F1-model_v4` (supports `--format cif|mmcif|pdb|bcif`)
+- Remote `http(s)` URLs (proxied & cached in memory; pass `--format` if suffix is missing)
+
+## CLI flags
+
+- `--port`, `-p`: bind port (default: ephemeral `0`)
+- `--host`: bind IPv4/IPv6 address (default: `127.0.0.1`; `0.0.0.0` / `::` auto-detects LAN IP for sharing)
+- `--no-open`: do not auto-open browser (also skipped automatically in SSH and headless Linux)
+- `--watch`, `-w`: live-reload viewer when a local file changes
+- `--auto-close` / `--keep-alive`: shut down when last browser tab closes or goes idle
+- `--idle-timeout`: idle seconds before auto-close (default: `15`, implies `--auto-close`)
+- `--fetch-timeout`: remote download timeout in seconds (default: `30`)
+- `--format`: explicit format (`pdb`, `cif`, `mmcif`, `bcif`, `pdbqt`, `sdf`, `mol`, `mol2`, `xyz`, `gro`)
+- `--base-url`: public URL and optional path prefix for reverse proxies / tunnels
+- `--private`: mount under a random unguessable path prefix (`/s/<token>/`)
+- `--qr`: print a Unicode QR code in the terminal
+- `--json`: print single-line JSON session metadata to stdout
+- `--detach`: start server in a detached background process, wait until listening, print info, exit `0`
+- `--version`, `-v`: show version
+
+## HTTP endpoints (relative to session root)
+
+- `GET /`: Mol* viewer HTML
+- `GET /structure`: raw structure payload (`?refresh=1` bypasses remote cache)
+- `GET /info` and `GET /health`: JSON session metadata (`status`, `version`, `name`, `format`, `source_kind`, `watch`, `auto_close`)
+- `GET /version`: JSON local file change signature (`{"version": "<mtime_ns>:<size>"}`)
+- `GET /heartbeat` & `POST /bye`: session lifecycle endpoints for `--auto-close`
+
+## Browser automation handle (`window.molbo`)
+
+When automating the viewer page (Playwright, Chrome DevTools, preview browser):
+
+- `await window.molbo.ready`: resolves once Mol* finishes creating the viewer and loading the structure
+- `window.molbo.viewer`: Mol* `Viewer` instance
+- `window.molbo.reload({ forceRefresh: true })`: reloads the structure while preserving camera state
+- `window.molbo.getCameraHash()` / `window.molbo.setCameraHash(hash)`: read/apply `#cam=...` view hashes
+- `window.molbo.getShareUrl(includeView)`: returns shareable URL (optionally with `#cam=...`)
+
+## Python API
+
+```python
+import molbo
+
+with molbo.serve("1crn") as session:
+    print(session.url, session.share_url, session.port)
+
+# Serve raw bytes directly:
+with molbo.serve(pdb_bytes, format="pdb", name="pose1.pdb") as session:
+    print(session.url)
+```

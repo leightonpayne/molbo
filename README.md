@@ -24,7 +24,7 @@ Opening a structure is as easy as:
 molbo structure.pdb
 ```
 
-Read [the documentation](https://leightonpayne.github.io/molbo/) for more information on what `molbo` can do.
+Read [the documentation](https://leightonpayne.github.io/molbo/) (or [llms.txt](https://leightonpayne.github.io/molbo/llms.txt) / [skills/molbo/SKILL.md](skills/molbo/SKILL.md) for AI agents) for more information on what `molbo` can do.
 
 ## License
 

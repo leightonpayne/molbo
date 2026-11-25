@@ -14,6 +14,14 @@ Supported local structure formats (each also supported with `.gz` compression):
 - Small-molecule & docking: `.sdf`, `.sd`, `.mol`, `.mol2`, `.pdbqt`
 - Coordinates & MD: `.xyz`, `.gro`
 
+## Standard input (`-`)
+
+Pipe a structure directly over `stdin` with `-` and `--format` (gzip-compressed streams are detected automatically):
+
+```bash
+cat structure.cif | molbo - --format cif
+```
+
 ## Remote URLs
 
 You can point `molbo` at an `http` or `https` URL and it will proxy the structure through the local session.
