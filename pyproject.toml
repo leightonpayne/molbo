@@ -49,6 +49,7 @@ exclude = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/molbo"]
 include = [
+    "src/molbo/py.typed",
     "src/molbo/viewer.html",
     "src/molbo/vendor/**/*",
 ]
