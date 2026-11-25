@@ -8,9 +8,11 @@ Contributions to `molbo` are welcome.
 
 ## Quick Start
 
-    git clone https://github.com/leightonpayne/molbo.git
-    cd molbo
-    uv sync
+```bash
+git clone https://github.com/leightonpayne/molbo.git
+cd molbo
+uv sync
+```
 
 ## Development Commands
 
@@ -19,17 +21,20 @@ Contributions to `molbo` are welcome.
 | `uv run python -m unittest discover -s tests -v` | Run tests |
 | `uv run ruff check .` | Run lint checks |
 | `uv run ruff format --check .` | Check formatting |
+| `uv run ty check` | Run static type checks |
 | `uv run zensical serve` | Serve docs locally |
 | `uv run zensical build` | Build docs locally |
 | `uv build` | Build sdist and wheel |
 
 ## Project Structure
 
-    src/molbo/
-    ├── cli.py        # Typer CLI entrypoint
-    ├── server.py     # Local HTTP server
-    ├── viewer.html   # Browser UI template
-    └── vendor/       # Vendored frontend assets
+```text
+src/molbo/
+├── cli.py        # Typer CLI entrypoint
+├── server.py     # Local HTTP server
+├── viewer.html   # Browser UI template
+└── vendor/       # Vendored frontend assets
+```
 
 ## Making Changes
 

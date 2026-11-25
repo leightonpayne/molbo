@@ -16,13 +16,19 @@ icon: lucide/funnel
 Bind to a Tailscale-reachable address and choose a fixed port:
 
 ```bash
-molbo 1crn --host 100.x.y.z --port 8080 --no-open --base-url http://100.x.y.z:8080
+molbo 1crn --host 100.x.y.z --port 8080 --no-open
 ```
 
 Anyone on the same tailnet can then open:
 
-```
+```text
 http://100.x.y.z:8080
+```
+
+Add `--base-url` when viewers should use a different public hostname, HTTPS URL, or path prefix (for example behind a reverse proxy or Tailscale Funnel):
+
+```bash
+molbo 1crn --host 127.0.0.1 --port 8080 --no-open --base-url https://molbo.example.com
 ```
 
 ## Share publicly with Tailscale Funnel
@@ -69,6 +75,28 @@ molbo 4hhb --host 127.0.0.1 --port 8082 --no-open \
   --base-url https://molbo.example.com/s/demo-2
 ```
 
-Then configure your reverse proxy so each path prefix forwards to the matching local port.
+Then configure your reverse proxy so each path prefix forwards **without stripping the prefix** to the matching local port. For example, with Caddy:
+
+```caddyfile
+molbo.example.com {
+    handle /s/demo-1* {
+        reverse_proxy 127.0.0.1:8081
+    }
+    handle /s/demo-2* {
+        reverse_proxy 127.0.0.1:8082
+    }
+}
+```
+
+Or with nginx (note the lack of a trailing `/` on `proxy_pass`, which preserves the prefix):
+
+```nginx
+location /s/demo-1 {
+    proxy_pass http://127.0.0.1:8081;
+}
+location /s/demo-2 {
+    proxy_pass http://127.0.0.1:8082;
+}
+```
 
 This is still one `molbo` process per session. `molbo` does not yet include a built-in multi-session registry or router.

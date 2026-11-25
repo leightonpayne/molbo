@@ -10,7 +10,7 @@ icon: lucide/house
 
 ## Overview
 
-`molbo` is a command-line launcher for interactive molecular structure viewing in [Mol*](https://molstar.org/). It accepts local structure files, remote structure URLs, 4-character PDB IDs, and starts a small HTTP server that serves a self-contained Mol* viewer from vendored frontend assets.
+`molbo` is a command-line launcher for interactive molecular structure viewing in [Mol*](https://molstar.org/). It accepts local structure files, remote structure URLs, PDB IDs, or AlphaFold DB IDs, and starts a small HTTP server that serves a self-contained Mol* viewer from vendored frontend assets.
 
 ## What it is for
 

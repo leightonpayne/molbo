@@ -4,12 +4,28 @@ icon: lucide/package
 
 # Installation
 
-## Install as a CLI tool with uv
+## Run without installing
 
-For normal use, install `molbo` globally with `uv`:
+Try `molbo` directly with `uvx`:
+
+```bash
+uvx molbo 1crn
+```
+
+## Install as a CLI tool
+
+For regular use, install `molbo` globally with `uv` (or `pipx` / `pip`):
 
 ```bash
 uv tool install molbo
+```
+
+```bash
+pipx install molbo
+```
+
+```bash
+pip install molbo
 ```
 
 ## Development setup
