@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
@@ -211,7 +213,8 @@ def _read_stdin_structure_source(format_override: str | None) -> StructureSource
         try:
             data = stdin_path.read_bytes()
         finally:
-            stdin_path.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                stdin_path.unlink(missing_ok=True)
     else:
         data = sys.stdin.buffer.read()
 
@@ -409,6 +412,29 @@ def _emit_ready_ui(
             )
 
 
+def _write_ready_file(ready_file_env: str, payload: dict[str, Any]) -> None:
+    ready_path = Path(ready_file_env)
+    tmp_path = ready_path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+    tmp_path.replace(ready_path)
+
+
+def _read_ready_file(ready_path: Path) -> dict[str, Any] | None:
+    if not ready_path.exists():
+        return None
+    try:
+        raw = ready_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _spawn_detached_server(
     *,
     source: str,
@@ -443,23 +469,20 @@ def _spawn_detached_server(
     if private:
         cmd.append("--private")
 
-    with tempfile.NamedTemporaryFile(prefix="molbo-ready-", suffix=".json", delete=False) as tf:
-        ready_path = Path(tf.name)
-    with tempfile.NamedTemporaryFile(prefix="molbo-err-", suffix=".log", delete=False) as ef:
-        err_path = Path(ef.name)
+    handoff_dir = Path(tempfile.mkdtemp(prefix="molbo-detach-"))
+    ready_path = handoff_dir / "ready.json"
 
-    stdin_path: Path | None = None
     env = os.environ.copy()
     env[_READY_FILE_ENV] = str(ready_path)
     if structure_source.inline_bytes is not None:
-        with tempfile.NamedTemporaryFile(prefix="molbo-stdin-", delete=False) as sf:
-            sf.write(structure_source.inline_bytes)
-            stdin_path = Path(sf.name)
+        stdin_path = handoff_dir / "stdin.bin"
+        stdin_path.write_bytes(structure_source.inline_bytes)
         env[_STDIN_FILE_ENV] = str(stdin_path)
 
     popen_kwargs: dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
         "env": env,
     }
     if os.name == "nt":
@@ -470,30 +493,25 @@ def _spawn_detached_server(
         popen_kwargs["start_new_session"] = True
 
     try:
-        with err_path.open("wb") as err_handle:
-            popen_kwargs["stderr"] = err_handle
-            proc = subprocess.Popen(cmd, **popen_kwargs)
+        proc = subprocess.Popen(cmd, **popen_kwargs)
 
         deadline = time.monotonic() + _DETACH_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
-            if ready_path.exists():
-                raw = ready_path.read_text(encoding="utf-8").strip()
-                if raw:
-                    try:
-                        payload = json.loads(raw)
-                        if isinstance(payload, dict):
-                            return payload
-                    except json.JSONDecodeError:
-                        pass
+            payload = _read_ready_file(ready_path)
+            if payload is not None:
+                if "error" in payload:
+                    err_console.print(f"[bold red]Error:[/] {escape_markup(str(payload['error']))}")
+                    raise typer.Exit(code=int(payload.get("exit_code", 1)))
+                return payload
             exit_code = proc.poll()
             if exit_code is not None:
-                err_text = err_path.read_text(encoding="utf-8", errors="replace").strip()
-                if err_text:
-                    err_console.print(err_text, markup=False)
-                else:
-                    err_console.print(
-                        f"[bold red]Error:[/] Detached molbo server exited with code {exit_code}."
-                    )
+                payload = _read_ready_file(ready_path)
+                if payload is not None and "error" in payload:
+                    err_console.print(f"[bold red]Error:[/] {escape_markup(str(payload['error']))}")
+                    raise typer.Exit(code=int(payload.get("exit_code", exit_code or 1)))
+                err_console.print(
+                    f"[bold red]Error:[/] Detached molbo server exited with code {exit_code}."
+                )
                 raise typer.Exit(code=exit_code or 1)
             time.sleep(0.02)
 
@@ -501,10 +519,7 @@ def _spawn_detached_server(
         err_console.print("[bold red]Error:[/] Timed out waiting for detached molbo server.")
         raise typer.Exit(code=1)
     finally:
-        ready_path.unlink(missing_ok=True)
-        err_path.unlink(missing_ok=True)
-        if stdin_path is not None and stdin_path.exists():
-            stdin_path.unlink(missing_ok=True)
+        shutil.rmtree(handoff_dir, ignore_errors=True)
 
 
 @app.command(epilog=_HELP_EPILOG)
@@ -672,6 +687,7 @@ def view(
     if private:
         normalized_base_url, base_path = _apply_private_path(normalized_base_url, base_path)
 
+    ready_file_env = os.environ.get(_READY_FILE_ENV)
     shutdown_event = threading.Event()
     try:
         server = make_server(
@@ -687,11 +703,20 @@ def view(
         )
     except OSError as exc:
         port_label = str(port) if port is not None else "auto"
-        err_console.print(
-            f"[bold red]Error:[/] Could not bind local server on "
-            f"[yellow]{escape_markup(host)}:{port_label}[/]."
-        )
-        err_console.print(f"[dim]{escape_markup(str(exc))}[/dim]")
+        if ready_file_env:
+            _write_ready_file(
+                ready_file_env,
+                {
+                    "error": f"Could not bind local server on {host}:{port_label}: {exc}",
+                    "exit_code": 1,
+                },
+            )
+        else:
+            err_console.print(
+                f"[bold red]Error:[/] Could not bind local server on "
+                f"[yellow]{escape_markup(host)}:{port_label}[/]."
+            )
+            err_console.print(f"[dim]{escape_markup(str(exc))}[/dim]")
         raise typer.Exit(code=1) from exc
 
     chosen_port = server.server_address[1]
@@ -707,7 +732,6 @@ def view(
             server.RequestHandlerClass, shutdown_event, timeout=heartbeat_timeout
         )
 
-    ready_file_env = os.environ.get(_READY_FILE_ENV)
     if ready_file_env:
         payload = _build_session_payload(
             structure_source=structure_source,
@@ -720,10 +744,7 @@ def view(
             auto_close=effective_auto_close,
             pid=os.getpid(),
         )
-        ready_path = Path(ready_file_env)
-        tmp_path = ready_path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(payload), encoding="utf-8")
-        tmp_path.replace(ready_path)
+        _write_ready_file(ready_file_env, payload)
     else:
         _emit_ready_ui(
             structure_source=structure_source,

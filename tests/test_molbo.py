@@ -18,7 +18,7 @@ import unittest
 import urllib.error
 import urllib.request
 from email.message import Message
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler
 from importlib.metadata import version
 from pathlib import Path
 from unittest import mock
@@ -41,6 +41,7 @@ from molbo.cli import (
 )
 from molbo.server import (
     StructureSource,
+    ThreadingHTTPServer,
     _accepts_gzip,
     _guess_mime,
     compute_heartbeat_interval_ms,
@@ -869,6 +870,40 @@ class CliTests(unittest.TestCase):
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGTERM)
 
+    def test_cli_detach_reports_bind_errors_cleanly(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as blocker,
+        ):
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                blocker.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            blocker.bind(("127.0.0.1", 0))
+            blocker.listen(1)
+            busy_port = blocker.getsockname()[1]
+
+            structure_path = Path(tmpdir) / "busy.pdb"
+            structure_path.write_bytes(b"HEADER busy\nEND\n")
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "molbo",
+                    str(structure_path),
+                    "--port",
+                    str(busy_port),
+                    "--detach",
+                    "--no-open",
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("Could not bind local server", completed.stderr)
+
 
 class PythonApiTests(unittest.TestCase):
     def test_serve_context_manager_for_local_file_and_raw_bytes(self) -> None:
@@ -978,7 +1013,7 @@ class RemoteServerTests(unittest.TestCase):
                 self.end_headers()
                 self.wfile.write(remote_body)
 
-        upstream = HTTPServer(("127.0.0.1", 0), RemoteHandler)
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), RemoteHandler)
         upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
         upstream_thread.start()
 
